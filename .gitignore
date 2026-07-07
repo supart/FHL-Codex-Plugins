@@ -1,0 +1,17 @@
+# Local secrets and machine-specific config
+.env
+.env.*
+*.local
+*.key
+*.pem
+
+# Generated output and logs
+output/
+logs/
+*.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

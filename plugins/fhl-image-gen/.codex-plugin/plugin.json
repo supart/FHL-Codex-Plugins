@@ -1,0 +1,22 @@
+{
+  "name": "fhl-image-gen",
+  "version": "0.1.0",
+  "description": "Generate and edit images through the FHL Responses API from Codex.",
+  "author": {
+    "name": "FHL Local"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "FHL Image Gen",
+    "shortDescription": "Generate and edit images with FHL Responses API.",
+    "longDescription": "A local Codex plugin for FHL image generation and image editing through the FHL Responses API, including fixed 2K aspect presets, multi-reference input_image edits, batch generation, and adaptive runs.",
+    "developerName": "FHL Local",
+    "category": "Productivity",
+    "capabilities": ["Write"],
+    "brandColor": "#18A9B0",
+    "composerIcon": "./assets/composer-icon.png",
+    "logo": "./assets/plugin-logo.png",
+    "logoDark": "./assets/plugin-logo-dark.png",
+    "defaultPrompt": "Generate an image with FHL Image Gen."
+  }
+}
