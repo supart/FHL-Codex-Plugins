@@ -9,6 +9,18 @@
 output/
 logs/
 *.log
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+
+# Plugin local artifacts
+plugins/fhl-image-gen/output/
+plugins/fhl-image-gen/logs/
+plugins/fhl-image-gen/tmp/
+plugins/fhl-image-gen/temp/
+plugins/fhl-image-gen/*.log
 
 # OS/editor noise
 .DS_Store
