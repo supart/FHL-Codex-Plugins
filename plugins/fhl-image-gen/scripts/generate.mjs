@@ -1,14 +1,22 @@
 #!/usr/bin/env node
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, parse } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 
 const API_ROOT = "https://www.fhl.mom";
 const RESPONSES_URL = `${API_ROOT}/v1/responses`;
+const IMAGES_GENERATIONS_URL = `${API_ROOT}/v1/images/generations`;
+const IMAGES_EDITS_URL = `${API_ROOT}/v1/images/edits`;
 const TEXT_MODEL = "gpt-5.5";
 const IMAGE_MODEL = "gpt-image-2";
+const APIMART_API_ROOT = String(process.env.APIMART_BASE_URL || process.env.APIMART_API_ROOT || "https://api.apib.ai").replace(/\/+$/, "");
+const APIMART_GENERATIONS_URL = `${APIMART_API_ROOT}/v1/images/generations`;
+const APIMART_TASKS_URL = `${APIMART_API_ROOT}/v1/tasks`;
+const APIMART_MODEL = "gpt-image-2";
+const APIMART_RESOLUTION = "1k";
+const APIMART_COST_NOTICE = "APIMart defaults to 1k because real backend billing changes with 1k/2k/4k size tiers.";
 const CONFIG_PATH = join(homedir(), ".codex", "fhl-image-gen-config.json");
 const NO_PROMPT_REVISION_INSTRUCTIONS = "You are a tool runner. Pass the user prompt to image_generation VERBATIM. DO NOT rewrite, expand, polish, or revise it in any way. Use the exact text the user gave.";
 
@@ -22,20 +30,51 @@ const MAX_EDIT_SOURCES = 10;
 const MAX_RETRIES = 3;
 const RETRY_BACKOFF_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 180_000;
+const APIMART_SUBMIT_TIMEOUT_MS = 240_000;
+const APIMART_DOWNLOAD_TIMEOUT_MS = 60_000;
+const APIMART_TASK_TIMEOUT_MS = 1_800_000;
+const APIMART_POLL_INTERVAL_MS = 4_000;
+const APIMART_WORKER_CONCURRENCY = Math.max(1, Math.min(Number.parseInt(process.env.APIMART_ACTIVE_LIMIT || "6", 10) || 6, MAX_CONCURRENCY));
+const PROVIDER_FHL = "fhl";
+const PROVIDER_APIMART = "apimart";
+const FHL_API_MODE_RESPONSES = "responses";
+const FHL_API_MODE_IMAGES = "images";
+const PROVIDER_ALIASES = {
+  fhl: PROVIDER_FHL,
+  responses: PROVIDER_FHL,
+  apimart: PROVIDER_APIMART,
+  "api-mart": PROVIDER_APIMART,
+  "apimart.ai": PROVIDER_APIMART,
+};
 const SUPPORTED_RATIOS = [
   "1:1",
   "3:2",
   "2:3",
   "4:3",
   "3:4",
+  "5:4",
+  "4:5",
   "16:9",
   "9:16",
   "2:1",
   "1:2",
+  "3:1",
+  "1:3",
   "7:4",
   "4:7",
 ];
-const DISABLED_RATIOS = new Set(["5:4", "4:5", "3:1", "1:3"]);
+const FHL_TESTED_RATIO_SUPPORT = {
+  generate: {
+    "1K": [...SUPPORTED_RATIOS],
+    "2K": ["1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16", "2:1", "1:2", "7:4", "4:7"],
+    "4K": ["1:1", "3:2", "2:3", "16:9", "9:16", "2:1", "1:2", "3:1", "1:3", "7:4", "4:7"],
+  },
+  edit: {
+    "1K": [...SUPPORTED_RATIOS],
+    "2K": [...SUPPORTED_RATIOS],
+    "4K": ["1:1", "3:2", "2:3", "16:9", "9:16", "2:1", "1:2", "3:1", "1:3", "7:4", "4:7"],
+  },
+};
 
 const SIZE_MATRIX = {
   "1K": {
@@ -61,14 +100,14 @@ const SIZE_MATRIX = {
     "2:3": "1360x2048",
     "4:3": "2048x1536",
     "3:4": "1536x2048",
-    "5:4": "2040x1632",
-    "4:5": "1632x2040",
+    "5:4": "2048x1632",
+    "4:5": "1632x2048",
     "16:9": "2048x1152",
     "9:16": "1152x2048",
     "2:1": "2048x1024",
     "1:2": "1024x2048",
-    "3:1": "2040x680",
-    "1:3": "680x2040",
+    "3:1": "2048x688",
+    "1:3": "688x2048",
     "7:4": "2208x1264",
     "4:7": "1264x2208",
   },
@@ -98,7 +137,7 @@ const DEFAULTS = {
   concurrency: 3,
 };
 const FIXED_REQUEST_QUALITY = "2K";
-const FHL_SIZE_LIMIT_NOTICE = "由于官方请求限制FHL只能接收1K图像，详细计费以后台为准。";
+const FHL_SIZE_LIMIT_NOTICE = "Current public FHL requests stay on the tested 2K preset. Real 1K/2K/4K ratio results are recorded in the help text and skill.";
 const WORKER_ID_PREFIX = "worker-";
 const DEFAULT_WORKER_NAME = "default";
 const DEFAULT_WORKER_COOLDOWN_MS = 60_000;
@@ -152,6 +191,50 @@ function previewKey(key) {
   return `${key.slice(0, 8)}...${key.slice(-4)}`;
 }
 
+function normalizeProvider(provider) {
+  const normalized = String(provider || "").trim().toLowerCase();
+  return PROVIDER_ALIASES[normalized] || null;
+}
+
+function normalizeApimartResolution(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "1k" || normalized === "2k" || normalized === "4k") return normalized;
+  return null;
+}
+
+function normalizeFhlApiMode(mode) {
+  const normalized = String(mode || "").trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized === FHL_API_MODE_RESPONSES) return FHL_API_MODE_RESPONSES;
+  if (normalized === FHL_API_MODE_IMAGES) return FHL_API_MODE_IMAGES;
+  return null;
+}
+
+function configuredFhlApiMode(config) {
+  return normalizeFhlApiMode(config?.fhlApiMode) || FHL_API_MODE_IMAGES;
+}
+
+function resolveFhlApiMode(config, flags = {}) {
+  return normalizeFhlApiMode(flags?.fhlApiMode) || configuredFhlApiMode(config);
+}
+
+function fhlModeLabel(mode) {
+  return `FHL/${normalizeFhlApiMode(mode) || FHL_API_MODE_RESPONSES}`;
+}
+
+function providerLabel(provider) {
+  const normalized = normalizeProvider(provider) || PROVIDER_FHL;
+  return normalized === PROVIDER_APIMART ? "APIMart" : "FHL";
+}
+
+function workerProvider(worker) {
+  return normalizeProvider(worker?.provider) || PROVIDER_FHL;
+}
+
+function routeLabelForWorker(worker, fhlApiMode) {
+  return workerProvider(worker) === PROVIDER_APIMART ? "APIMart" : fhlModeLabel(fhlApiMode);
+}
+
 function nextWorkerId(workers) {
   let maxId = 0;
   for (const worker of workers || []) {
@@ -171,6 +254,7 @@ function normalizeWorkerRecord(rawWorker, normalizedWorkers, index, now) {
   if (!rawWorker || typeof rawWorker !== "object") return null;
   const apiKey = String(rawWorker.apiKey || "").trim();
   if (!apiKey) return null;
+  const provider = normalizeProvider(rawWorker.provider) || PROVIDER_FHL;
 
   const existingIds = new Set(normalizedWorkers.map((worker) => worker.id));
   let id = String(rawWorker.id || "").trim();
@@ -179,17 +263,20 @@ function normalizeWorkerRecord(rawWorker, normalizedWorkers, index, now) {
   return {
     id,
     name: String(rawWorker.name || "").trim() || workerFallbackName(id, index),
+    provider,
     apiKey,
     enabled: rawWorker.enabled !== false,
     createdAt: String(rawWorker.createdAt || "").trim() || now,
   };
 }
 
-function createWorkerRecord(apiKey, name, existingWorkers = []) {
+function createWorkerRecord(apiKey, name, existingWorkers = [], provider = PROVIDER_FHL) {
   const id = nextWorkerId(existingWorkers);
+  const normalizedProvider = normalizeProvider(provider) || PROVIDER_FHL;
   return {
     id,
     name: String(name || "").trim() || workerFallbackName(id, existingWorkers.length),
+    provider: normalizedProvider,
     apiKey: String(apiKey || "").trim(),
     enabled: true,
     createdAt: new Date().toISOString(),
@@ -208,6 +295,7 @@ function normalizeConfigShape(config) {
     normalizedWorkers.push({
       id: `${WORKER_ID_PREFIX}1`,
       name: DEFAULT_WORKER_NAME,
+      provider: PROVIDER_FHL,
       apiKey: String(source.apiKey).trim(),
       enabled: true,
       createdAt: now,
@@ -224,6 +312,7 @@ function normalizeConfigShape(config) {
     if (
       worker.id !== rawWorker.id
       || worker.name !== rawWorker.name
+      || worker.provider !== (normalizeProvider(rawWorker.provider) || PROVIDER_FHL)
       || worker.enabled !== (rawWorker.enabled !== false)
       || worker.createdAt !== rawWorker.createdAt
       || worker.apiKey !== rawWorker.apiKey
@@ -234,6 +323,26 @@ function normalizeConfigShape(config) {
   }
 
   normalized.workers = normalizedWorkers;
+  if (source.defaultProvider != null) {
+    const defaultProvider = normalizeProvider(source.defaultProvider);
+    if (defaultProvider) {
+      normalized.defaultProvider = defaultProvider;
+      if (source.defaultProvider !== defaultProvider) changed = true;
+    } else {
+      delete normalized.defaultProvider;
+      changed = true;
+    }
+  }
+  if (source.fhlApiMode != null) {
+    const fhlApiMode = normalizeFhlApiMode(source.fhlApiMode);
+    if (fhlApiMode) {
+      normalized.fhlApiMode = fhlApiMode;
+      if (source.fhlApiMode !== fhlApiMode) changed = true;
+    } else {
+      delete normalized.fhlApiMode;
+      changed = true;
+    }
+  }
   if ("apiKey" in normalized) {
     delete normalized.apiKey;
     changed = true;
@@ -262,14 +371,16 @@ function loadConfig() {
 
 function getConfiguredWorkers(config, options = {}) {
   const requireEnabled = options.requireEnabled === true;
-  const workers = Array.isArray(config?.workers) ? config.workers.filter((worker) => worker?.apiKey) : [];
+  const provider = normalizeProvider(options.provider);
+  let workers = Array.isArray(config?.workers) ? config.workers.filter((worker) => worker?.apiKey) : [];
+  if (provider) workers = workers.filter((worker) => workerProvider(worker) === provider);
   return requireEnabled ? workers.filter((worker) => worker.enabled !== false) : workers;
 }
 
 function getEnabledWorkersOrExit(config) {
   const workers = getConfiguredWorkers(config, { requireEnabled: true });
   if (workers.length === 0) {
-    console.error("ERROR: No enabled FHL API worker is configured. Run --set-key <key> for single-worker setup or --add-worker-key <key> to build a worker pool.");
+    console.error("ERROR: No enabled FHL API worker is configured. Run --set-key <key> first.");
     process.exit(1);
   }
   return workers;
@@ -305,6 +416,7 @@ function summarizeWorker(worker, index) {
     index: index + 1,
     id: worker.id,
     name: worker.name,
+    provider: workerProvider(worker),
     enabled: worker.enabled !== false,
     keyPreview: previewKey(worker.apiKey),
     createdAt: worker.createdAt || null,
@@ -315,36 +427,66 @@ function workerLimitErrorMessage(count) {
   return `ERROR: Worker pool supports up to ${MAX_WORKERS} API workers. Current configured workers: ${count}. Remove extra workers before continuing.`;
 }
 
-function isWorkerLimitExceeded(config) {
-  return getConfiguredWorkers(config).length > MAX_WORKERS;
+function isWorkerLimitExceeded(config, options = {}) {
+  return getConfiguredWorkers(config, { provider: options.provider }).length > MAX_WORKERS;
 }
 
-function buildConfigSummary(config) {
+function buildConfigSummary(config, options = {}) {
+  const internal = options.internal === true;
   const workers = getConfiguredWorkers(config);
-  const enabledWorkers = workers.filter((worker) => worker.enabled !== false);
-  return {
-    hasKey: workers.length > 0,
-    keyPreview: workers.length === 1 ? previewKey(workers[0].apiKey) : null,
-    workerCount: workers.length,
+  const fhlWorkers = workers.filter((worker) => workerProvider(worker) === PROVIDER_FHL);
+  const visibleWorkers = internal ? workers : fhlWorkers;
+  const enabledVisibleWorkers = visibleWorkers.filter((worker) => worker.enabled !== false);
+  const fhlApiMode = configuredFhlApiMode(config);
+  const summary = {
+    hasKey: fhlWorkers.length > 0,
+    keyPreview: fhlWorkers.length === 1 ? previewKey(fhlWorkers[0].apiKey) : null,
+    defaultProvider: PROVIDER_FHL,
+    fhlApiMode,
+    workerCount: visibleWorkers.length,
     workerLimit: MAX_WORKERS,
-    workerLimitExceeded: workers.length > MAX_WORKERS,
-    enabledWorkerCount: enabledWorkers.length,
-    workers: workers.map(summarizeWorker),
+    workerLimitExceeded: visibleWorkers.length > MAX_WORKERS,
+    enabledWorkerCount: enabledVisibleWorkers.length,
+    providers: {
+      [PROVIDER_FHL]: {
+        apiMode: fhlApiMode,
+        workerCount: fhlWorkers.length,
+        enabledWorkerCount: fhlWorkers.filter((worker) => worker.enabled !== false).length,
+      },
+    },
+    workers: visibleWorkers.map(summarizeWorker),
     quickMode: config?.quickMode || null,
     batchMode: config?.batchMode || null,
   };
+  if (internal) {
+    const apimartWorkers = workers.filter((worker) => workerProvider(worker) === PROVIDER_APIMART);
+    summary.defaultProvider = normalizeProvider(config?.defaultProvider) || null;
+    summary.workerCount = workers.length;
+    summary.workerLimitExceeded = workers.length > MAX_WORKERS;
+    summary.enabledWorkerCount = workers.filter((worker) => worker.enabled !== false).length;
+    summary.apimartWorkerConcurrency = APIMART_WORKER_CONCURRENCY;
+    summary.providers[PROVIDER_APIMART] = {
+      workerCount: apimartWorkers.length,
+      enabledWorkerCount: apimartWorkers.filter((worker) => worker.enabled !== false).length,
+    };
+  }
+  return summary;
 }
 
-function printWorkerList(config) {
-  const workers = getConfiguredWorkers(config);
+function printWorkerList(config, options = {}) {
+  const internal = options.internal === true;
+  const workers = internal
+    ? getConfiguredWorkers(config)
+    : getConfiguredWorkers(config, { provider: PROVIDER_FHL });
   if (workers.length === 0) {
-    console.log(`Workers: none configured (limit ${MAX_WORKERS})`);
+    console.log(`FHL workers: none configured (limit ${MAX_WORKERS})`);
     return;
   }
   const enabled = workers.filter((worker) => worker.enabled !== false).length;
-  console.log(`Workers: ${workers.length} total, ${enabled} enabled, limit ${MAX_WORKERS}`);
+  console.log(`${internal ? "Workers" : "FHL workers"}: ${workers.length} total, ${enabled} enabled, limit ${MAX_WORKERS}`);
   workers.forEach((worker, index) => {
-    console.log(`${index + 1}. ${worker.name} [${worker.id}] ${worker.enabled !== false ? "enabled" : "disabled"} key=${previewKey(worker.apiKey)}`);
+    const providerText = internal ? ` provider=${workerProvider(worker)}` : "";
+    console.log(`${index + 1}. ${worker.name} [${worker.id}]${providerText} ${worker.enabled !== false ? "enabled" : "disabled"} key=${previewKey(worker.apiKey)}`);
   });
   if (workers.length > MAX_WORKERS) console.log(workerLimitErrorMessage(workers.length));
 }
@@ -363,14 +505,44 @@ function normalizeRatio(ratio) {
   return RATIO_ALIASES[normalized] || normalized;
 }
 
+function normalizeApiMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized === "responses" || normalized === "images" || normalized === "auto") return normalized;
+  return null;
+}
+
 function ratioLabel(ratio) {
   const canonical = normalizeRatio(ratio);
   const alias = Object.entries(RATIO_ALIASES).find(([, value]) => value === canonical)?.[0];
   return alias ? `${canonical} (${alias})` : canonical;
 }
 
-function supportedRatioText() {
-  return SUPPORTED_RATIOS.join(", ");
+function normalizeOperation(operation) {
+  return String(operation || "").trim().toLowerCase() === "edit" ? "edit" : "generate";
+}
+
+function testedQualityLabel(quality) {
+  const normalized = String(quality || "").trim().toUpperCase();
+  if (normalized === "1K" || normalized === "2K" || normalized === "4K") return normalized;
+  return FIXED_REQUEST_QUALITY;
+}
+
+function supportedRatiosForRequest(options = {}) {
+  const provider = normalizeProvider(options.provider) || PROVIDER_FHL;
+  if (provider === PROVIDER_APIMART) return SUPPORTED_RATIOS;
+  const operation = normalizeOperation(options.operation);
+  const quality = testedQualityLabel(options.quality);
+  return FHL_TESTED_RATIO_SUPPORT[operation]?.[quality] || [];
+}
+
+function supportedRatioText(options = {}) {
+  return supportedRatiosForRequest(options).join(", ");
+}
+
+function isRatioSupportedForRequest(ratio, options = {}) {
+  const normalizedRatio = normalizeRatio(ratio);
+  return supportedRatiosForRequest(options).includes(normalizedRatio);
 }
 
 function normalizeSizeString(size) {
@@ -392,16 +564,17 @@ function supportedAspectFromSize(size) {
   return SUPPORTED_RATIOS.includes(aspect) ? aspect : null;
 }
 
-function isDisabledRatio(ratio) {
-  return DISABLED_RATIOS.has(normalizeRatio(ratio));
+function resolveSizeFromMatrix(matrixKey, ratio, explicitSize = null) {
+  if (explicitSize) return normalizeSizeString(explicitSize);
+  const normalizedRatio = normalizeRatio(ratio);
+  if (!matrixKey) return null;
+  return SIZE_MATRIX[matrixKey]?.[normalizedRatio] || null;
 }
 
 function resolveSize(quality, ratio, explicitSize = null) {
-  if (explicitSize) return normalizeSizeString(explicitSize);
   const normalizedQuality = normalizeQuality(quality);
-  const normalizedRatio = normalizeRatio(ratio);
   if (!normalizedQuality) return null;
-  return SIZE_MATRIX[normalizedQuality]?.[normalizedRatio] || null;
+  return resolveSizeFromMatrix(normalizedQuality, ratio, explicitSize);
 }
 
 function clampInteger(value, min, max, fallback) {
@@ -515,6 +688,11 @@ function buildWorkflowOutputRoot(userDir) {
   return resolveOutputDir(userDir || join(homedir(), "Pictures", "fhl-image-gen", `workflow_${timestamp()}`));
 }
 
+function buildApimartRoundtripOutputRoot(userDir, resolution = APIMART_RESOLUTION) {
+  const suffix = normalizeApimartResolution(resolution) || APIMART_RESOLUTION;
+  return resolveOutputDir(userDir || join(homedir(), "Pictures", "fhl-image-gen", `apimart_roundtrip_${suffix}_${timestamp()}`));
+}
+
 function imageMimeTypeFromPath(path) {
   const lower = path.toLowerCase();
   if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
@@ -579,6 +757,278 @@ async function requestWithTimeout(url, init, timeoutMs) {
   }
 }
 
+function powerShellJsonRequest(apiKey, method, url, body = null, timeoutMs = APIMART_SUBMIT_TIMEOUT_MS) {
+  const script = `
+$ErrorActionPreference = 'Stop'
+$headers = @{
+  Accept = 'application/json'
+  Authorization = "Bearer $env:APIMART_API_KEY"
+}
+$uri = $env:APIMART_URL
+$method = $env:APIMART_METHOD
+if ($env:APIMART_HAS_BODY -eq '1') {
+  $json = [Console]::In.ReadToEnd()
+  $response = Invoke-RestMethod -Uri $uri -Method $method -Headers $headers -ContentType 'application/json' -Body $json
+} else {
+  $response = Invoke-RestMethod -Uri $uri -Method $method -Headers $headers
+}
+$response | ConvertTo-Json -Depth 100
+`;
+  const result = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    script,
+  ], {
+    encoding: "utf8",
+    input: body ? JSON.stringify(body) : "",
+    timeout: timeoutMs,
+    maxBuffer: 10 * 1024 * 1024,
+    env: {
+      ...process.env,
+      APIMART_API_KEY: apiKey,
+      APIMART_URL: url,
+      APIMART_METHOD: method,
+      APIMART_HAS_BODY: body ? "1" : "0",
+    },
+  });
+  if (result.error) return { ok: false, error: result.error.message };
+  if (result.status !== 0) {
+    let details = (result.stderr || result.stdout || "").trim();
+    try {
+      const parsed = JSON.parse(details);
+      const status = parsed.status ? `HTTP ${parsed.status}: ` : "";
+      details = `${status}${parsed.body || parsed.message || details}`;
+    } catch {}
+    return { ok: false, error: details || `PowerShell exited with ${result.status}` };
+  }
+  try {
+    return { ok: true, json: JSON.parse(result.stdout) };
+  } catch (error) {
+    return { ok: false, error: `Invalid APIMart JSON response: ${error?.message || String(error)}` };
+  }
+}
+
+async function requestApimartJson(apiKey, method, url, body = null, timeoutMs = APIMART_SUBMIT_TIMEOUT_MS) {
+  try {
+    const headers = {
+      Accept: "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    };
+    if (body) headers["Content-Type"] = "application/json";
+    const res = await requestWithTimeout(url, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    }, timeoutMs);
+    if (!res.ok) return { ok: false, error: await parseErrorResponse(res) };
+    return { ok: true, json: await res.json() };
+  } catch (error) {
+    if (process.platform === "win32") {
+      return powerShellJsonRequest(apiKey, method, url, body, timeoutMs);
+    }
+    return { ok: false, error: error?.message || String(error) };
+  }
+}
+
+function downloadWithPowerShell(url, timeoutMs = APIMART_DOWNLOAD_TIMEOUT_MS) {
+  const suffix = Math.random().toString(36).slice(2, 10);
+  const tempPath = join(tmpdir(), `apimart_image_${timestamp()}_${suffix}.bin`);
+  const script = `
+$ErrorActionPreference = 'Stop'
+Invoke-WebRequest -Uri $env:APIMART_URL -Method Get -OutFile $env:APIMART_OUT
+`;
+  const result = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    script,
+  ], {
+    encoding: "utf8",
+    timeout: timeoutMs,
+    maxBuffer: 1024 * 1024,
+    env: {
+      ...process.env,
+      APIMART_URL: url,
+      APIMART_OUT: tempPath,
+    },
+  });
+  try {
+    if (result.error) return { ok: false, error: result.error.message };
+    if (result.status !== 0) {
+      const details = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
+      return { ok: false, error: details || `PowerShell exited with ${result.status}` };
+    }
+    return { ok: true, buffer: readFileSync(tempPath) };
+  } finally {
+    try {
+      if (existsSync(tempPath)) unlinkSync(tempPath);
+    } catch {}
+  }
+}
+
+function parseApimartData(json) {
+  const data = json?.data;
+  if (Array.isArray(data)) return data[0] || null;
+  if (data && typeof data === "object") return data;
+  return json && typeof json === "object" ? json : null;
+}
+
+function apimartJsonError(json) {
+  if (!json || typeof json !== "object") return "";
+  const message = json?.error?.message
+    || json?.error
+    || json?.message
+    || json?.msg
+    || json?.data?.message
+    || json?.data?.error;
+  if (message) return String(message);
+  if (json.code != null && Number(json.code) !== 200) return `APIMart code ${json.code}`;
+  return "";
+}
+
+function extractApimartTaskId(json) {
+  const data = parseApimartData(json);
+  return String(data?.task_id || data?.taskId || data?.id || "").trim();
+}
+
+function apimartTaskStatus(json) {
+  const data = parseApimartData(json);
+  return String(data?.status || json?.status || "").trim().toLowerCase();
+}
+
+function isApimartDoneStatus(status) {
+  return ["completed", "succeeded", "success", "done"].includes(String(status || "").toLowerCase());
+}
+
+function isApimartFailedStatus(status) {
+  return ["failed", "error", "cancelled", "canceled", "rejected", "timeout", "expired"].includes(String(status || "").toLowerCase());
+}
+
+function collectApimartImagePayloads(value, payloads = [], hint = "") {
+  if (value == null) return payloads;
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (/^https?:\/\//i.test(text)) payloads.push({ type: "url", value: text });
+    else if (/^data:image\//i.test(text)) payloads.push({ type: "base64", value: text });
+    else if (hint && /(?:base64|b64)/i.test(hint) && text.length > 128) payloads.push({ type: "base64", value: text });
+    return payloads;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectApimartImagePayloads(item, payloads, hint);
+    return payloads;
+  }
+  if (typeof value === "object") {
+    for (const [key, item] of Object.entries(value)) {
+      if (["url", "image_url", "imageUrl", "b64_json", "base64", "image", "images", "result", "results", "output", "outputs"].includes(key)) {
+        collectApimartImagePayloads(item, payloads, key);
+      }
+    }
+  }
+  return payloads;
+}
+
+function extractApimartImagePayload(json) {
+  const data = parseApimartData(json);
+  const candidates = [
+    data?.result,
+    data?.results,
+    data?.output,
+    data?.outputs,
+    data?.images,
+    data?.image,
+    data?.image_url,
+    data?.imageUrl,
+    data?.url,
+    data?.b64_json,
+    data?.base64,
+  ];
+  const payloads = [];
+  for (const candidate of candidates) collectApimartImagePayloads(candidate, payloads);
+  return payloads[0] || null;
+}
+
+function buildApimartImageBody(prompt, size, sourceDataURLs = [], options = {}) {
+  const aspect = supportedAspectFromSize(size) || aspectRatioForSize(size) || DEFAULTS.ratio;
+  const resolution = normalizeApimartResolution(options.resolution) || APIMART_RESOLUTION;
+  const body = {
+    model: APIMART_MODEL,
+    prompt: String(prompt || ""),
+    n: 1,
+    size: aspect,
+    resolution,
+    official_fallback: false,
+  };
+  if (sourceDataURLs.length > 0) body.image_urls = sourceDataURLs;
+  return body;
+}
+
+function apimartSaveTargetSize(requestedSize) {
+  const aspect = supportedAspectFromSize(requestedSize) || aspectRatioForSize(requestedSize);
+  const quality = APIMART_RESOLUTION.toUpperCase();
+  return aspect && SIZE_MATRIX[quality]?.[aspect] ? SIZE_MATRIX[quality][aspect] : requestedSize;
+}
+
+async function submitApimartImageTask(apiKey, body) {
+  const response = await requestApimartJson(apiKey, "POST", APIMART_GENERATIONS_URL, body, APIMART_SUBMIT_TIMEOUT_MS);
+  if (!response.ok) return { ok: false, error: response.error };
+  const json = response.json;
+  const apiError = apimartJsonError(json);
+  if (apiError) return { ok: false, error: apiError };
+  const taskId = extractApimartTaskId(json);
+  if (!taskId) return { ok: false, error: "APIMart did not return task_id" };
+  return { ok: true, taskId, json };
+}
+
+async function fetchApimartTask(apiKey, taskId) {
+  const url = `${APIMART_TASKS_URL}/${encodeURIComponent(taskId)}?language=zh`;
+  const response = await requestApimartJson(apiKey, "GET", url, null, APIMART_SUBMIT_TIMEOUT_MS);
+  if (!response.ok) return { ok: false, error: response.error };
+  const json = response.json;
+  const apiError = apimartJsonError(json);
+  if (apiError) return { ok: false, error: apiError, json };
+  return { ok: true, json };
+}
+
+async function waitForApimartImage(apiKey, taskId, start) {
+  while (Date.now() - start < APIMART_TASK_TIMEOUT_MS) {
+    const task = await fetchApimartTask(apiKey, taskId);
+    if (!task.ok) return task;
+    const status = apimartTaskStatus(task.json);
+    if (isApimartDoneStatus(status)) {
+      const payload = extractApimartImagePayload(task.json);
+      if (payload) return { ok: true, payload, status, json: task.json };
+      return { ok: false, error: "APIMart task completed without an image result", status, json: task.json };
+    }
+    if (isApimartFailedStatus(status)) {
+      return { ok: false, error: `APIMart task ${status || "failed"}`, status, json: task.json };
+    }
+    await sleep(APIMART_POLL_INTERVAL_MS);
+  }
+  return { ok: false, error: `APIMart task timeout (${APIMART_TASK_TIMEOUT_MS / 1000}s)` };
+}
+
+async function downloadApimartImagePayload(payload) {
+  if (!payload) return { ok: false, error: "Missing APIMart image payload" };
+  if (payload.type === "base64") {
+    return { ok: true, base64: payload.value };
+  }
+  try {
+    const res = await requestWithTimeout(payload.value, {
+      method: "GET",
+      headers: { Accept: "image/*,*/*" },
+    }, APIMART_DOWNLOAD_TIMEOUT_MS);
+    if (!res.ok) return { ok: false, error: await parseErrorResponse(res) };
+    const arrayBuffer = await res.arrayBuffer();
+    return { ok: true, buffer: Buffer.from(arrayBuffer) };
+  } catch (error) {
+    if (process.platform === "win32") return downloadWithPowerShell(payload.value, APIMART_DOWNLOAD_TIMEOUT_MS);
+    return { ok: false, error: error?.message || String(error) };
+  }
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -604,6 +1054,8 @@ function isRetryableError(error) {
     "econnreset",
     "terminated",
     "no image_generation_call result",
+    "no b64_json image",
+    "images api returned url instead of b64_json",
   ].some((pattern) => text.includes(pattern));
 }
 
@@ -660,6 +1112,21 @@ function isTaskFatalError(error) {
   ].some((pattern) => text.includes(pattern));
 }
 
+function isRouteFallbackEligible(error) {
+  const text = String(error || "").toLowerCase();
+  if (!text) return false;
+  if (isWorkerFatalError(text) || isTaskFatalError(text)) return false;
+  if (isRetryableError(text)) return true;
+  return [
+    "no image_generation_call result",
+    "no b64_json image",
+    "images api returned url instead of b64_json",
+    "invalid json",
+    "unexpected end of json",
+    "no image result",
+  ].some((pattern) => text.includes(pattern));
+}
+
 function truncateText(text, max = 60) {
   const value = String(text || "");
   return value.length > max ? `${value.slice(0, max)}...` : value;
@@ -689,21 +1156,66 @@ function saveBase64Image(base64, outputDir, prefix, index = null, targetSize = n
   return savePngBuffer(path, buffer, targetSize);
 }
 
+function saveImageBuffer(buffer, outputDir, prefix, index = null, targetSize = null) {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) return null;
+  const suffix = Math.random().toString(36).slice(2, 6);
+  const numbered = index == null ? "" : `_${index}`;
+  const filename = `${prefix}_${timestamp()}${numbered}_${suffix}.png`;
+  const path = join(outputDir, filename);
+  return savePngBuffer(path, buffer, targetSize);
+}
+
+function buildDerivedResizePath(path, targetSize) {
+  const parsed = parse(path);
+  const normalizedTarget = normalizeSizeString(targetSize) || "target";
+  return join(parsed.dir, `${parsed.name}__resized_${normalizedTarget}${parsed.ext || ".png"}`);
+}
+
 function savePngBuffer(path, buffer, targetSize = null) {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, buffer);
-  const resizeInfo = ensurePngTargetSize(path, targetSize);
-  const finalBuffer = resizeInfo?.resized ? readFileSync(path) : buffer;
-  const dimensions = readPngDimensions(finalBuffer);
+  const dimensions = readPngDimensions(buffer);
+  let resizedCopyPath = null;
+  let resizedCopyBuffer = null;
+  let resizedCopyDimensions = null;
+  let resizeError = null;
+
+  if (targetSize) {
+    const target = parseSizeForAspect(targetSize);
+    if (!target) {
+      resizeError = `Invalid resize target: ${targetSize}`;
+    } else if (!dimensions || dimensions.width !== target.width || dimensions.height !== target.height) {
+      resizedCopyPath = buildDerivedResizePath(path, targetSize);
+      writeFileSync(resizedCopyPath, buffer);
+      const resizeInfo = ensurePngTargetSize(resizedCopyPath, targetSize);
+      if (resizeInfo?.error) {
+        resizeError = resizeInfo.error;
+        try {
+          if (existsSync(resizedCopyPath)) unlinkSync(resizedCopyPath);
+        } catch {}
+        resizedCopyPath = null;
+      } else if (existsSync(resizedCopyPath)) {
+        resizedCopyBuffer = readFileSync(resizedCopyPath);
+        resizedCopyDimensions = readPngDimensions(resizedCopyBuffer);
+      }
+    }
+  }
+
   return {
     path,
-    fileSize: `${(finalBuffer.length / 1024 / 1024).toFixed(2)}MB`,
-    width: dimensions?.width || resizeInfo?.width || null,
-    height: dimensions?.height || resizeInfo?.height || null,
+    rawPath: path,
+    fileSize: `${(buffer.length / 1024 / 1024).toFixed(2)}MB`,
+    width: dimensions?.width || null,
+    height: dimensions?.height || null,
     dimensions: dimensions ? `${dimensions.width}x${dimensions.height}` : null,
-    resized: !!resizeInfo?.resized,
-    originalDimensions: resizeInfo?.originalWidth ? `${resizeInfo.originalWidth}x${resizeInfo.originalHeight}` : null,
-    resizeError: resizeInfo?.error || null,
+    resized: false,
+    originalDimensions: null,
+    resizeError,
+    resizedCopyPath,
+    resizedCopyFileSize: resizedCopyBuffer ? `${(resizedCopyBuffer.length / 1024 / 1024).toFixed(2)}MB` : null,
+    resizedCopyWidth: resizedCopyDimensions?.width || null,
+    resizedCopyHeight: resizedCopyDimensions?.height || null,
+    resizedCopyDimensions: resizedCopyDimensions ? `${resizedCopyDimensions.width}x${resizedCopyDimensions.height}` : null,
   };
 }
 
@@ -714,11 +1226,16 @@ function saveBase64ImageToPath(base64, path, targetSize = null) {
   return savePngBuffer(path, buffer, targetSize);
 }
 
+function buildImagesPrompt(prompt, size) {
+  const aspectPromptSuffix = aspectPromptSuffixForSize(size);
+  return aspectPromptSuffix ? `${prompt}\n\n${aspectPromptSuffix}` : prompt;
+}
+
 function formatImageResult(result) {
   const parts = [result.fileSize].filter(Boolean);
   if (result.dimensions) parts.push(result.dimensions);
-  if (result.resized && result.originalDimensions) parts.push(`resized from ${result.originalDimensions}`);
-  if (result.resizeError) parts.push(`resize warning: ${result.resizeError}`);
+  if (result.resizedCopyPath && result.resizedCopyDimensions) parts.push(`resized copy ${result.resizedCopyDimensions}`);
+  if (result.resizeError) parts.push(`resize copy warning: ${result.resizeError}`);
   return parts.join(", ");
 }
 
@@ -749,6 +1266,58 @@ function extractImagesFromResponse(data) {
   return items
     .map((item) => item?.b64_json || item?.image?.b64_json || item?.base64)
     .filter((item) => typeof item === "string" && item.trim());
+}
+
+function buildImagesGenerationBody(prompt, size) {
+  return {
+    model: IMAGE_MODEL,
+    prompt: buildImagesPrompt(prompt, size),
+    n: 1,
+    size,
+    quality: "auto",
+    output_format: "png",
+    response_format: "b64_json",
+  };
+}
+
+function diagnosticImageFieldName(fieldMode, index) {
+  if (fieldMode === "repeat-image") return "image";
+  if (fieldMode === "array") return "image[]";
+  return index === 0 ? "image" : "image[]";
+}
+
+function buildImagesEditFormWithFieldMode(prompt, size, sources, fieldMode = "mixed") {
+  const form = new FormData();
+  const sourceList = Array.isArray(sources) ? sources : [];
+  sourceList.forEach((source, index) => {
+    const field = diagnosticImageFieldName(fieldMode, index);
+    const filename = source?.sourceName || `source_${index + 1}.${source?.ext || "png"}`;
+    form.append(field, new Blob([source.sourceBuffer], {
+      type: source?.mimeType || "image/png",
+    }), filename);
+  });
+  form.append("prompt", buildImagesPrompt(prompt, size));
+  form.append("model", IMAGE_MODEL);
+  form.append("n", "1");
+  form.append("size", size);
+  form.append("quality", "auto");
+  form.append("output_format", "png");
+  form.append("response_format", "b64_json");
+  return form;
+}
+
+function buildImagesEditForm(prompt, size, sources) {
+  return buildImagesEditFormWithFieldMode(prompt, size, sources, "mixed");
+}
+
+function extractImagesFromImagesApiResponse(data) {
+  const images = extractImagesFromResponse(data);
+  if (images.length > 0) return { ok: true, images };
+  const items = Array.isArray(data?.data) ? data.data : [];
+  if (items.some((item) => typeof item?.url === "string" && item.url.trim())) {
+    return { ok: false, error: "Images API returned URL instead of b64_json" };
+  }
+  return { ok: false, error: "No b64_json image in Images API response" };
 }
 
 function parseSSEEventLine(line) {
@@ -1055,7 +1624,7 @@ function buildResponsesEditBody(prompt, size, sourceDataURLs) {
 }
 
 async function generateImage(apiKey, prompt, size, outputDir, options = {}) {
-  const resize = options.resize !== false;
+  const resize = options.resize === true;
   const start = Date.now();
   try {
     const res = await requestWithTimeout(RESPONSES_URL, {
@@ -1066,20 +1635,60 @@ async function generateImage(apiKey, prompt, size, outputDir, options = {}) {
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify(buildResponsesGenerationBody(prompt, size)),
-    }, REQUEST_TIMEOUT_MS);
-    if (!res.ok) return { ok: false, elapsed: Date.now() - start, error: await parseErrorResponse(res) };
+    }, task.timeoutMs || REQUEST_TIMEOUT_MS);
+    if (!res.ok) return { ok: false, elapsed: Date.now() - start, error: await parseErrorResponse(res), routeLabel: fhlModeLabel(FHL_API_MODE_RESPONSES) };
 
     const raw = await res.text();
     const [base64] = extractImagesFromResponses(raw);
     const saved = saveBase64Image(base64, outputDir, "img", null, resize ? size : null);
     const elapsed = Date.now() - start;
-    if (!saved) return { ok: false, elapsed, error: "No image_generation_call result in Responses stream" };
-    return { ok: true, elapsed, ...saved };
+    if (!saved) return { ok: false, elapsed, error: "No image_generation_call result in Responses stream", routeLabel: fhlModeLabel(FHL_API_MODE_RESPONSES) };
+    return { ok: true, elapsed, routeLabel: fhlModeLabel(FHL_API_MODE_RESPONSES), ...saved };
+  } catch (error) {
+    return {
+      ok: false,
+      elapsed: Date.now() - start,
+        error: error?.name === "AbortError" ? `Timeout (${(task.timeoutMs || REQUEST_TIMEOUT_MS) / 1000}s)` : error?.message || String(error),
+      routeLabel: fhlModeLabel(FHL_API_MODE_RESPONSES),
+    };
+  }
+}
+
+async function generateImageViaImages(apiKey, prompt, size, outputDir, options = {}) {
+  const resize = options.resize === true;
+  const start = Date.now();
+  try {
+    const res = await requestWithTimeout(IMAGES_GENERATIONS_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(buildImagesGenerationBody(prompt, size)),
+    }, REQUEST_TIMEOUT_MS);
+    if (!res.ok) return { ok: false, elapsed: Date.now() - start, error: await parseErrorResponse(res), routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES) };
+
+    const raw = await res.text();
+    let parsed = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return { ok: false, elapsed: Date.now() - start, error: "Images API returned invalid JSON", routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES) };
+    }
+    const extracted = extractImagesFromImagesApiResponse(parsed);
+    if (!extracted.ok) return { ok: false, elapsed: Date.now() - start, error: extracted.error, routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES) };
+
+    const saved = saveBase64Image(extracted.images[0], outputDir, "img", null, resize ? size : null);
+    const elapsed = Date.now() - start;
+    if (!saved) return { ok: false, elapsed, error: "No b64_json image in Images API response", routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES) };
+    return { ok: true, elapsed, routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES), ...saved };
   } catch (error) {
     return {
       ok: false,
       elapsed: Date.now() - start,
       error: error?.name === "AbortError" ? `Timeout (${REQUEST_TIMEOUT_MS / 1000}s)` : error?.message || String(error),
+      routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES),
     };
   }
 }
@@ -1124,8 +1733,473 @@ function loadSourceImages(imagePaths) {
   };
 }
 
+function normalizeDiagnosticFieldMode(value) {
+  const normalized = String(value || "mixed").trim().toLowerCase();
+  if (["mixed", "repeat-image", "array"].includes(normalized)) return normalized;
+  return null;
+}
+
+function parseDiagnosticCsv(value, fallback) {
+  if (value == null || value === "") return fallback;
+  return String(value)
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function parseDiagnosticRefCounts(value, fallback = [2, 3, 5, 10]) {
+  const counts = parseDiagnosticCsv(value, fallback.map(String))
+    .map((item) => Number.parseInt(item, 10))
+    .filter((item) => Number.isInteger(item) && item >= 1 && item <= MAX_EDIT_SOURCES);
+  return [...new Set(counts)].sort((a, b) => a - b);
+}
+
+function parseDiagnosticUploadEdges(value, fallback = ["native"]) {
+  return parseDiagnosticCsv(value, fallback).map((item) => {
+    const normalized = String(item).trim().toLowerCase();
+    if (["native", "original", "raw"].includes(normalized)) return "native";
+    const parsed = Number.parseInt(normalized, 10);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+  }).filter((item) => item != null);
+}
+
+function normalizeDiagnosticCombinationMode(value) {
+  const normalized = String(value || "first").trim().toLowerCase();
+  if (["first", "sliding"].includes(normalized)) return normalized;
+  return null;
+}
+
+function selectDiagnosticSources(sources, refCount, attempt, combinationMode) {
+  if (combinationMode !== "sliding") return sources.slice(0, refCount);
+  const selected = [];
+  const start = Math.max(0, attempt - 1);
+  for (let index = 0; index < refCount; index++) {
+    selected.push(sources[(start + index) % sources.length]);
+  }
+  return selected;
+}
+
+function diagnosticSafeName(value) {
+  return String(value || "item")
+    .replace(/[\\/:*?"<>|]+/g, "_")
+    .replace(/\s+/g, "_")
+    .slice(0, 80);
+}
+
+function fitWithinMaxEdge(width, height, maxEdge) {
+  const longest = Math.max(width, height);
+  if (!Number.isFinite(longest) || longest <= 0 || longest <= maxEdge) return { width, height, changed: false };
+  const scale = maxEdge / longest;
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+    changed: true,
+  };
+}
+
+function resizePngFitWithPowerShell(path, width, height) {
+  const command = `
+$ErrorActionPreference = 'Stop'
+$Path = ${powershellSingleQuoted(path)}
+$TargetWidth = ${width}
+$TargetHeight = ${height}
+Add-Type -AssemblyName System.Drawing
+$image = [System.Drawing.Image]::FromFile($Path)
+$bitmap = $null
+$graphics = $null
+$tmp = "$Path.tmp.png"
+try {
+  $bitmap = New-Object System.Drawing.Bitmap $TargetWidth, $TargetHeight
+  $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+  $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+  $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+  $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+  $graphics.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+  $dest = New-Object System.Drawing.Rectangle 0, 0, $TargetWidth, $TargetHeight
+  $graphics.DrawImage($image, $dest)
+  $graphics.Dispose(); $graphics = $null
+  $image.Dispose(); $image = $null
+  $bitmap.Save($tmp, [System.Drawing.Imaging.ImageFormat]::Png)
+  $bitmap.Dispose(); $bitmap = $null
+  Move-Item -LiteralPath $tmp -Destination $Path -Force
+} finally {
+  if ($graphics -ne $null) { $graphics.Dispose() }
+  if ($bitmap -ne $null) { $bitmap.Dispose() }
+  if ($image -ne $null) { $image.Dispose() }
+  if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
+}
+`;
+  const result = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    command,
+  ], { encoding: "utf8" });
+  if (result.error) return { ok: false, error: result.error.message };
+  if (result.status !== 0) {
+    const details = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
+    return { ok: false, error: details || `PowerShell exited with ${result.status}` };
+  }
+  return { ok: true };
+}
+
+function makeDiagnosticUploadSources(sources, uploadRoot, maxEdge, label) {
+  if (maxEdge === "native") {
+    return sources.map((source, index) => ({
+      ...source,
+      diagnosticUpload: {
+        index: index + 1,
+        sourcePath: source.imagePath,
+        uploadPath: source.imagePath,
+        mode: "native",
+        originalBytes: source.sourceBuffer.length,
+        uploadBytes: source.sourceBuffer.length,
+        originalDimensions: readPngDimensions(source.sourceBuffer),
+        uploadDimensions: readPngDimensions(source.sourceBuffer),
+      },
+    }));
+  }
+
+  mkdirSync(uploadRoot, { recursive: true });
+  return sources.map((source, index) => {
+    const originalDimensions = readPngDimensions(source.sourceBuffer);
+    const outputName = `${String(index + 1).padStart(2, "0")}_${diagnosticSafeName(parse(source.sourceName).name)}_max${maxEdge}.png`;
+    const outputPath = join(uploadRoot, outputName);
+    writeFileSync(outputPath, source.sourceBuffer);
+    let resizeError = null;
+    if (originalDimensions) {
+      const fitted = fitWithinMaxEdge(originalDimensions.width, originalDimensions.height, maxEdge);
+      if (fitted.changed) {
+        const resized = resizePngFitWithPowerShell(outputPath, fitted.width, fitted.height);
+        if (!resized.ok) resizeError = resized.error;
+      }
+    } else {
+      resizeError = "source is not a readable PNG; copied without resizing";
+    }
+    const uploadBuffer = readFileSync(outputPath);
+    const uploadDimensions = readPngDimensions(uploadBuffer);
+    return {
+      ...source,
+      imagePath: outputPath,
+      sourceName: basename(outputPath),
+      sourceBuffer: uploadBuffer,
+      mimeType: "image/png",
+      ext: "png",
+      dataURL: imageDataURLFromBuffer(uploadBuffer, "image/png"),
+      diagnosticUpload: {
+        index: index + 1,
+        sourcePath: source.imagePath,
+        uploadPath: outputPath,
+        mode: label,
+        originalBytes: source.sourceBuffer.length,
+        uploadBytes: uploadBuffer.length,
+        originalDimensions,
+        uploadDimensions,
+        resizeError,
+      },
+    };
+  });
+}
+
+function diagnosticErrorSummary(text, max = 260) {
+  return String(text || "").replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+async function runFhlDiagnosticEditTask(worker, task, outputRoot) {
+  const started = Date.now();
+  const resultName = `${String(task.refCount).padStart(2, "0")}refs_${task.fieldMode}_${task.uploadLabel}_${worker.name || worker.id}_a${task.attempt}`;
+  const resultPath = join(outputRoot, "results", `${diagnosticSafeName(resultName)}.png`);
+  try {
+    const res = await requestWithTimeout(IMAGES_EDITS_URL, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${worker.apiKey}`,
+      },
+      body: buildImagesEditFormWithFieldMode(task.prompt, task.size, task.sources, task.fieldMode),
+    }, REQUEST_TIMEOUT_MS);
+    const raw = await res.text();
+    const elapsed = Date.now() - started;
+    if (!res.ok) {
+      return {
+        ok: false,
+        status: res.status,
+        elapsed,
+        error: diagnosticErrorSummary(await parseErrorBody(res.status, raw)),
+        workerId: worker.id,
+        workerName: worker.name,
+      };
+    }
+    let parsed = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return {
+        ok: false,
+        status: res.status,
+        elapsed,
+        error: "Images API returned invalid JSON",
+        workerId: worker.id,
+        workerName: worker.name,
+      };
+    }
+    const extracted = extractImagesFromImagesApiResponse(parsed);
+    if (!extracted.ok) {
+      return {
+        ok: false,
+        status: res.status,
+        elapsed,
+        error: extracted.error,
+        workerId: worker.id,
+        workerName: worker.name,
+      };
+    }
+    const saved = saveBase64ImageToPath(extracted.images[0], resultPath, null);
+    if (!saved) {
+      return {
+        ok: false,
+        status: res.status,
+        elapsed,
+        error: "No b64_json image in Images API response",
+        workerId: worker.id,
+        workerName: worker.name,
+      };
+    }
+    return {
+      ok: true,
+      status: res.status,
+      elapsed,
+      workerId: worker.id,
+      workerName: worker.name,
+      path: saved.path,
+      fileSize: saved.fileSize,
+      width: saved.width,
+      height: saved.height,
+      dimensions: saved.dimensions,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: null,
+      elapsed: Date.now() - started,
+      error: error?.name === "AbortError" ? `Timeout (${REQUEST_TIMEOUT_MS / 1000}s)` : error?.message || String(error),
+      workerId: worker.id,
+      workerName: worker.name,
+    };
+  }
+}
+
+function csvValue(value) {
+  if (value == null) return "";
+  const text = String(value);
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function writeFhlDiagnosticReports(outputRoot, manifest) {
+  mkdirSync(outputRoot, { recursive: true });
+  const manifestPath = join(outputRoot, "manifest.json");
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+  const rows = [
+    ["suite", "refCount", "fieldMode", "uploadLabel", "combinationMode", "attempt", "parallel", "worker", "ok", "status", "seconds", "dimensions", "bytes", "path", "error"],
+    ...manifest.results.map((item) => [
+      item.suite,
+      item.refCount,
+      item.fieldMode,
+      item.uploadLabel,
+      item.combinationMode,
+      item.attempt,
+      item.parallel,
+      item.workerName,
+      item.ok,
+      item.status,
+      Math.round((item.elapsed || 0) / 1000),
+      item.dimensions || "",
+      item.bytes || "",
+      item.path || "",
+      item.error || "",
+    ]),
+  ];
+  const summaryPath = join(outputRoot, "summary.csv");
+  writeFileSync(summaryPath, rows.map((row) => row.map(csvValue).join(",")).join("\n"), "utf8");
+  const failuresPath = join(outputRoot, "failures.json");
+  writeFileSync(failuresPath, JSON.stringify(manifest.results.filter((item) => !item.ok), null, 2), "utf8");
+  return { manifestPath, summaryPath, failuresPath };
+}
+
+function buildFhlDiagnosticTasks(flags, prompts, size, sources, outputRoot) {
+  const suite = String(flags.diagnosticSuite || "fields").trim().toLowerCase();
+  const prompt = prompts[0];
+  const fieldModes = suite === "fields"
+    ? parseDiagnosticCsv(flags.fieldModes || flags.fieldMode, ["mixed", "repeat-image", "array"]).map(normalizeDiagnosticFieldMode).filter(Boolean)
+    : [normalizeDiagnosticFieldMode(flags.fieldMode) || "mixed"];
+  const defaultRefCounts = suite === "upload" ? [3, 5, 8, 10] : [2, 3, 5, 10];
+  const refCounts = parseDiagnosticRefCounts(flags.refCounts, defaultRefCounts).filter((count) => count <= sources.length);
+  const uploadEdges = suite === "upload"
+    ? parseDiagnosticUploadEdges(flags.uploadMaxEdges || flags.uploadMaxEdge, ["native", "1536", "1024", "768"])
+    : parseDiagnosticUploadEdges(flags.uploadMaxEdges || flags.uploadMaxEdge, ["native"]);
+  const attempts = clampInteger(flags.diagnosticAttempts, 1, 20, 1);
+  const timeoutMs = clampInteger(flags.diagnosticTimeoutMs, 30_000, 900_000, REQUEST_TIMEOUT_MS);
+  const parallel = flags.diagnosticParallel === true || suite === "concurrency";
+  const combinationMode = normalizeDiagnosticCombinationMode(flags.diagnosticCombinationMode) || "first";
+  const tasks = [];
+  for (const fieldMode of fieldModes) {
+    for (const uploadEdge of uploadEdges) {
+      const uploadLabel = uploadEdge === "native" ? "native" : `max${uploadEdge}`;
+      for (const refCount of refCounts) {
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+          const taskSources = selectDiagnosticSources(sources, refCount, attempt, combinationMode);
+          const uploadRoot = join(outputRoot, "uploads", `${fieldMode}_${uploadLabel}_${String(refCount).padStart(2, "0")}refs_a${attempt}`);
+          const diagnosticSources = flags.dryRun
+            ? taskSources.map((source, index) => ({
+              ...source,
+              diagnosticUpload: {
+                index: index + 1,
+                sourcePath: source.imagePath,
+                uploadPath: source.imagePath,
+                mode: uploadLabel,
+                originalBytes: source.sourceBuffer.length,
+                uploadBytes: source.sourceBuffer.length,
+                originalDimensions: readPngDimensions(source.sourceBuffer),
+                uploadDimensions: readPngDimensions(source.sourceBuffer),
+              },
+            }))
+            : makeDiagnosticUploadSources(taskSources, uploadRoot, uploadEdge, uploadLabel);
+          tasks.push({
+            suite,
+            prompt,
+            size,
+            fieldMode,
+            uploadEdge,
+            uploadLabel,
+            combinationMode,
+            refCount,
+            attempt,
+            parallel,
+            timeoutMs,
+            sources: diagnosticSources,
+          });
+        }
+      }
+    }
+  }
+  return tasks;
+}
+
+async function runFhlMultirefDiagnostic(config, flags, prompts) {
+  if (prompts.length === 0) {
+    console.error("ERROR: --fhl-multiref-diagnostic requires --prompt <text>.");
+    return 1;
+  }
+  const imagePaths = flags.images || [];
+  if (imagePaths.length < 2) {
+    console.error("ERROR: --fhl-multiref-diagnostic requires at least two --image <path> values.");
+    return 1;
+  }
+  if (imagePaths.length > MAX_EDIT_SOURCES) {
+    console.error(`ERROR: Diagnostic supports up to ${MAX_EDIT_SOURCES} source images.`);
+    return 1;
+  }
+  const sourceGroup = loadSourceImages(imagePaths);
+  if (!sourceGroup.ok) {
+    console.error(`ERROR: ${sourceGroup.error}`);
+    return 1;
+  }
+  const provider = PROVIDER_FHL;
+  const workers = getConfiguredWorkers(config, { provider }).filter((worker) => worker.enabled !== false && worker.apiKey);
+  if (workers.length === 0) {
+    console.error("ERROR: No enabled FHL worker is configured.");
+    return 1;
+  }
+  const requestedAspect = flags.aspect ?? flags.ratio ?? "9:16";
+  const { size } = resolveGenerationParams({ ...flags, aspect: requestedAspect }, { quality: FIXED_REQUEST_QUALITY, ratio: requestedAspect }, { provider, operation: "edit" });
+  const outputRoot = flags.outputDir || join(homedir(), "Pictures", "fhl-image-gen", `fhl_multiref_diagnostic_${timestamp()}`);
+  const tasks = buildFhlDiagnosticTasks(flags, prompts, size, sourceGroup.sources, outputRoot);
+  if (tasks.length === 0) {
+    console.error("ERROR: Diagnostic task matrix is empty.");
+    return 1;
+  }
+
+  console.log(`FHL multiref diagnostic`);
+  console.log(`Output: ${outputRoot}`);
+  console.log(`Size: ${size}`);
+  console.log(`Sources: ${sourceGroup.sources.length}`);
+  console.log(`Workers: ${workers.length}`);
+  console.log(`Tasks: ${tasks.length}`);
+  if (flags.dryRun) {
+    for (const task of tasks) {
+      console.log(`DRY ${task.suite} refs=${task.refCount} field=${task.fieldMode} upload=${task.uploadLabel} combo=${task.combinationMode} attempt=${task.attempt} parallel=${task.parallel}`);
+    }
+    return 0;
+  }
+
+  mkdirSync(join(outputRoot, "results"), { recursive: true });
+  const started = Date.now();
+  const runTask = async (task, index) => {
+    const worker = workers[index % workers.length];
+    const result = await runFhlDiagnosticEditTask(worker, task, outputRoot);
+    const uploads = task.sources.map((source) => source.diagnosticUpload);
+    const record = {
+      suite: task.suite,
+      refCount: task.refCount,
+      fieldMode: task.fieldMode,
+      uploadLabel: task.uploadLabel,
+      combinationMode: task.combinationMode,
+      attempt: task.attempt,
+      parallel: task.parallel,
+      requestedSize: task.size,
+      timeoutMs: task.timeoutMs,
+      workerId: result.workerId,
+      workerName: result.workerName,
+      ok: result.ok,
+      status: result.status,
+      elapsed: result.elapsed,
+      seconds: Math.round((result.elapsed || 0) / 1000),
+      path: result.path || null,
+      fileSize: result.fileSize || null,
+      bytes: result.path && existsSync(result.path) ? readFileSync(result.path).length : null,
+      width: result.width || null,
+      height: result.height || null,
+      dimensions: result.dimensions || null,
+      error: result.error || null,
+      uploads,
+    };
+    console.log(`${record.ok ? "OK" : "FAIL"} refs=${record.refCount} field=${record.fieldMode} upload=${record.uploadLabel} worker=${record.workerName} status=${record.status} ${record.seconds}s${record.path ? ` ${record.path}` : ` ${record.error}`}`);
+    return record;
+  };
+
+  const results = [];
+  const parallel = tasks.some((task) => task.parallel);
+  if (parallel) {
+    results.push(...await Promise.all(tasks.map((task, index) => runTask(task, index))));
+  } else {
+    for (const [index, task] of tasks.entries()) {
+      results.push(await runTask(task, index));
+    }
+  }
+
+  const manifest = {
+    createdAt: new Date().toISOString(),
+    provider,
+    route: "images_edits",
+    model: IMAGE_MODEL,
+    prompt: prompts[0],
+    requestedSize: size,
+    elapsedMs: Date.now() - started,
+    sourceImages: imagePaths,
+    results,
+  };
+  const reportPaths = writeFhlDiagnosticReports(outputRoot, manifest);
+  const successCount = results.filter((item) => item.ok).length;
+  console.log(`Summary: ${successCount}/${results.length} succeeded`);
+  console.log(`Manifest: ${reportPaths.manifestPath}`);
+  console.log(`Summary CSV: ${reportPaths.summaryPath}`);
+  console.log(`Failures: ${reportPaths.failuresPath}`);
+  return successCount === results.length ? 0 : 1;
+}
+
 async function editImageViaResponsesOnce(apiKey, sources, prompt, size, outputDir, options = {}) {
-  const resize = options.resize !== false;
+  const resize = options.resize === true;
   const start = Date.now();
   const sourceDataURLs = sources.map((item) => item.dataURL).filter(Boolean);
   const sourceName = summarizeSources(sources);
@@ -1143,7 +2217,7 @@ async function editImageViaResponsesOnce(apiKey, sources, prompt, size, outputDi
     if (!res.ok) {
       const raw = await res.text().catch(() => "");
       if (rawLogPath) saveTextArtifact(rawLogPath, raw);
-      return { ok: false, elapsed: Date.now() - start, error: parseErrorBody(res.status, raw), sourceName };
+      return { ok: false, elapsed: Date.now() - start, error: parseErrorBody(res.status, raw), sourceName, routeLabel: fhlModeLabel(FHL_API_MODE_RESPONSES) };
     }
 
     const raw = await res.text();
@@ -1153,16 +2227,225 @@ async function editImageViaResponsesOnce(apiKey, sources, prompt, size, outputDi
       ? saveBase64ImageToPath(base64, options.savePath, resize ? size : null)
       : saveBase64Image(base64, outputDir, "edit", options.saveIndex ?? null, resize ? size : null);
     const elapsed = Date.now() - start;
-    if (!saved) return { ok: false, elapsed, error: "No image_generation_call result in Responses stream", sourceName };
-    return { ok: true, elapsed, ...saved, sourceName };
+    if (!saved) return { ok: false, elapsed, error: "No image_generation_call result in Responses stream", sourceName, routeLabel: fhlModeLabel(FHL_API_MODE_RESPONSES) };
+    return { ok: true, elapsed, ...saved, sourceName, routeLabel: fhlModeLabel(FHL_API_MODE_RESPONSES) };
   } catch (error) {
     return {
       ok: false,
       elapsed: Date.now() - start,
       error: error?.name === "AbortError" ? `Timeout (${REQUEST_TIMEOUT_MS / 1000}s)` : error?.message || String(error),
       sourceName,
+      routeLabel: fhlModeLabel(FHL_API_MODE_RESPONSES),
     };
   }
+}
+
+async function editImageViaImagesOnce(apiKey, sources, prompt, size, outputDir, options = {}) {
+  const resize = options.resize === true;
+  const start = Date.now();
+  const sourceName = summarizeSources(sources);
+  try {
+    const res = await requestWithTimeout(IMAGES_EDITS_URL, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: buildImagesEditForm(prompt, size, sources),
+    }, REQUEST_TIMEOUT_MS);
+    if (!res.ok) return { ok: false, elapsed: Date.now() - start, error: await parseErrorResponse(res), sourceName, routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES) };
+
+    const raw = await res.text();
+    let parsed = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return { ok: false, elapsed: Date.now() - start, error: "Images API returned invalid JSON", sourceName, routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES) };
+    }
+    const extracted = extractImagesFromImagesApiResponse(parsed);
+    if (!extracted.ok) return { ok: false, elapsed: Date.now() - start, error: extracted.error, sourceName, routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES) };
+
+    const saved = options.savePath
+      ? saveBase64ImageToPath(extracted.images[0], options.savePath, resize ? size : null)
+      : saveBase64Image(extracted.images[0], outputDir, "edit", options.saveIndex ?? null, resize ? size : null);
+    const elapsed = Date.now() - start;
+    if (!saved) return { ok: false, elapsed, error: "No b64_json image in Images API response", sourceName, routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES) };
+    return { ok: true, elapsed, ...saved, sourceName, routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES) };
+  } catch (error) {
+    return {
+      ok: false,
+      elapsed: Date.now() - start,
+      error: error?.name === "AbortError" ? `Timeout (${REQUEST_TIMEOUT_MS / 1000}s)` : error?.message || String(error),
+      sourceName,
+      routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES),
+    };
+  }
+}
+
+async function saveApimartResult(payload, outputDir, prefix, index, targetSize) {
+  const downloaded = await downloadApimartImagePayload(payload);
+  if (!downloaded.ok) return downloaded;
+  const saved = downloaded.base64
+    ? saveBase64Image(downloaded.base64, outputDir, prefix, index, targetSize)
+    : saveImageBuffer(downloaded.buffer, outputDir, prefix, index, targetSize);
+  if (!saved) return { ok: false, error: "APIMart image result could not be saved" };
+  return { ok: true, ...saved };
+}
+
+async function generateImageViaApimart(apiKey, prompt, size, outputDir, options = {}) {
+  const resize = options.resize === true;
+  const resolution = normalizeApimartResolution(options.apimartResolution) || APIMART_RESOLUTION;
+  const start = Date.now();
+  try {
+    const submitted = await submitApimartImageTask(apiKey, buildApimartImageBody(prompt, size, [], { resolution }));
+    if (!submitted.ok) return { ok: false, elapsed: Date.now() - start, error: submitted.error, routeLabel: "APIMart" };
+    const completed = await waitForApimartImage(apiKey, submitted.taskId, start);
+    if (!completed.ok) return { ok: false, elapsed: Date.now() - start, error: completed.error, taskId: submitted.taskId, routeLabel: "APIMart" };
+    const saved = await saveApimartResult(completed.payload, outputDir, "img", null, resize ? apimartSaveTargetSize(size) : null);
+    if (!saved.ok) return { ok: false, elapsed: Date.now() - start, error: saved.error, taskId: submitted.taskId, routeLabel: "APIMart" };
+    return { ok: true, elapsed: Date.now() - start, taskId: submitted.taskId, routeLabel: "APIMart", ...saved };
+  } catch (error) {
+    return {
+      ok: false,
+      elapsed: Date.now() - start,
+      error: error?.name === "AbortError" ? `Timeout (${APIMART_TASK_TIMEOUT_MS / 1000}s)` : error?.message || String(error),
+      routeLabel: "APIMart",
+    };
+  }
+}
+
+async function editImageViaApimart(apiKey, sources, prompt, size, outputDir, options = {}) {
+  const resize = options.resize === true;
+  const resolution = normalizeApimartResolution(options.apimartResolution) || APIMART_RESOLUTION;
+  const start = Date.now();
+  const sourceDataURLs = sources.map((item) => item.dataURL).filter(Boolean);
+  const sourceName = summarizeSources(sources);
+  try {
+    const submitted = await submitApimartImageTask(apiKey, buildApimartImageBody(prompt, size, sourceDataURLs, { resolution }));
+    if (!submitted.ok) return { ok: false, elapsed: Date.now() - start, error: submitted.error, sourceName, routeLabel: "APIMart" };
+    const completed = await waitForApimartImage(apiKey, submitted.taskId, start);
+    if (!completed.ok) return { ok: false, elapsed: Date.now() - start, error: completed.error, taskId: submitted.taskId, sourceName, routeLabel: "APIMart" };
+    let saved = null;
+    if (options.savePath) {
+      const downloaded = await downloadApimartImagePayload(completed.payload);
+      if (!downloaded.ok) return { ok: false, elapsed: Date.now() - start, error: downloaded.error, taskId: submitted.taskId, sourceName, routeLabel: "APIMart" };
+      saved = downloaded.base64
+        ? saveBase64ImageToPath(downloaded.base64, options.savePath, resize ? apimartSaveTargetSize(size) : null)
+        : savePngBuffer(options.savePath, downloaded.buffer, resize ? apimartSaveTargetSize(size) : null);
+    } else {
+      const result = await saveApimartResult(completed.payload, outputDir, "edit", options.saveIndex ?? null, resize ? apimartSaveTargetSize(size) : null);
+      if (!result.ok) return { ok: false, elapsed: Date.now() - start, error: result.error, taskId: submitted.taskId, sourceName, routeLabel: "APIMart" };
+      saved = result;
+    }
+    if (!saved) return { ok: false, elapsed: Date.now() - start, error: "APIMart image result could not be saved", taskId: submitted.taskId, sourceName, routeLabel: "APIMart" };
+    return { ok: true, elapsed: Date.now() - start, taskId: submitted.taskId, routeLabel: "APIMart", ...saved, sourceName };
+  } catch (error) {
+    return {
+      ok: false,
+      elapsed: Date.now() - start,
+      error: error?.name === "AbortError" ? `Timeout (${APIMART_TASK_TIMEOUT_MS / 1000}s)` : error?.message || String(error),
+      sourceName,
+      routeLabel: "APIMart",
+    };
+  }
+}
+
+async function generateImageForWorker(worker, prompt, size, outputDir, options = {}) {
+  if (workerProvider(worker) === PROVIDER_APIMART) {
+    return generateImageViaApimart(worker.apiKey, prompt, size, outputDir, options);
+  }
+  if (normalizeFhlApiMode(options.fhlApiMode) === FHL_API_MODE_IMAGES) {
+    return generateImageViaImages(worker.apiKey, prompt, size, outputDir, options);
+  }
+  return generateImage(worker.apiKey, prompt, size, outputDir, options);
+}
+
+async function editImageForWorker(worker, sources, prompt, size, outputDir, options = {}) {
+  if (workerProvider(worker) === PROVIDER_APIMART) {
+    return editImageViaApimart(worker.apiKey, sources, prompt, size, outputDir, options);
+  }
+  if (normalizeFhlApiMode(options.fhlApiMode) === FHL_API_MODE_IMAGES) {
+    return editImageViaImagesOnce(worker.apiKey, sources, prompt, size, outputDir, options);
+  }
+  return editImageViaResponsesOnce(worker.apiKey, sources, prompt, size, outputDir, options);
+}
+
+function finalizeRoutedTaskResult(result, meta) {
+  return {
+    ...result,
+    routeUsed: meta.routeUsed,
+    primaryRoute: meta.primaryRoute,
+    fallbackRoute: meta.fallbackRoute || null,
+    fallbackTriggered: !!meta.fallbackTriggered,
+    responsesError: meta.responsesError || null,
+    imagesError: meta.imagesError || null,
+  };
+}
+
+function composeDualRouteError(primaryRoute, primaryError, fallbackRoute, fallbackError) {
+  return `${primaryRoute} failed: ${primaryError}; ${fallbackRoute} failed: ${fallbackError}`;
+}
+
+async function runSingleTaskWithApiMode(apiMode, routes) {
+  const mode = normalizeApiMode(apiMode) || "auto";
+  const executeRoute = async (routeName) => routes[routeName]();
+
+  if (mode === "responses") {
+    const result = await executeRoute("responses");
+    return finalizeRoutedTaskResult(result, {
+      routeUsed: "responses",
+      primaryRoute: "responses",
+      responsesError: result.ok ? null : result.error,
+    });
+  }
+
+  if (mode === "images") {
+    const result = await executeRoute("images");
+    return finalizeRoutedTaskResult(result, {
+      routeUsed: "images",
+      primaryRoute: "images",
+      imagesError: result.ok ? null : result.error,
+    });
+  }
+
+  const primary = await executeRoute("responses");
+  if (primary.ok) {
+    return finalizeRoutedTaskResult(primary, {
+      routeUsed: "responses",
+      primaryRoute: "responses",
+    });
+  }
+
+  if (!isRouteFallbackEligible(primary.error)) {
+    return finalizeRoutedTaskResult(primary, {
+      routeUsed: "responses",
+      primaryRoute: "responses",
+      responsesError: primary.error,
+    });
+  }
+
+  const fallback = await executeRoute("images");
+  if (fallback.ok) {
+    return finalizeRoutedTaskResult(fallback, {
+      routeUsed: "images",
+      primaryRoute: "responses",
+      fallbackRoute: "images",
+      fallbackTriggered: true,
+      responsesError: primary.error,
+    });
+  }
+
+  return finalizeRoutedTaskResult({
+    ...fallback,
+    error: composeDualRouteError("responses", primary.error, "images", fallback.error),
+  }, {
+    routeUsed: "images",
+    primaryRoute: "responses",
+    fallbackRoute: "images",
+    fallbackTriggered: true,
+    responsesError: primary.error,
+    imagesError: fallback.error,
+  });
 }
 
 function createWorkerSession(worker) {
@@ -1182,6 +2465,32 @@ function createWorkerSession(worker) {
       fatalErrors: 0,
     },
   };
+}
+
+function workerSlotCount(worker) {
+  return workerProvider(worker) === PROVIDER_APIMART ? APIMART_WORKER_CONCURRENCY : 1;
+}
+
+function createWorkerSessions(workers) {
+  const sessions = [];
+  for (const worker of workers) {
+    const slots = workerSlotCount(worker);
+    if (slots <= 1) {
+      sessions.push(createWorkerSession(worker));
+      continue;
+    }
+    for (let index = 0; index < slots; index += 1) {
+      sessions.push(createWorkerSession({
+        ...worker,
+        id: `${worker.id}#${index + 1}`,
+        name: `${worker.name || worker.id}#${index + 1}`,
+        baseWorkerId: worker.id,
+        slotIndex: index + 1,
+        slotCount: slots,
+      }));
+    }
+  }
+  return sessions;
 }
 
 function activeWorkerCount(sessions) {
@@ -1384,7 +2693,7 @@ async function runWorkerTaskQueue(workers, tasks, options = {}) {
     return returnReport ? report : report.exitCode;
   }
 
-  const sessions = enabledWorkers.map(createWorkerSession);
+  const sessions = createWorkerSessions(enabledWorkers);
   const taskStates = createTaskStates(tasks);
   const groupAssignments = new Map();
   const runningGroups = new Set();
@@ -1562,8 +2871,115 @@ async function runWorkerTaskQueue(workers, tasks, options = {}) {
   return returnReport ? report : report.exitCode;
 }
 
+async function runSingleGenerate(workers, prompt, size, outputDir, options = {}) {
+  const apiMode = normalizeApiMode(options.apiMode) || "images";
+  const fhlApiMode = normalizeFhlApiMode(options.fhlApiMode);
+  const resize = options.resize === true;
+  const report = await runWorkerTaskQueue(workers, [{
+    prompt,
+    fhlApiMode,
+    startText: `Generating: "${truncateText(prompt)}"`,
+  }], {
+    concurrency: 1,
+    adaptive: options.adaptive !== false,
+    maxRetries: options.maxRetries ?? MAX_RETRIES,
+    retryDelayMs: options.retryDelayMs ?? RETRY_BACKOFF_MS,
+    outputDir,
+    returnReport: true,
+    onTaskStart: (task, context) => {
+      console.log(`[${context.index + 1}/${context.total}] ${task.startText} via ${workerLabel(context.worker)} [${routeLabelForWorker(context.worker, task.fhlApiMode)}]`);
+    },
+    runTask: async (worker, task) => {
+      if (workerProvider(worker) === PROVIDER_APIMART) {
+        return generateImageForWorker(worker, task.prompt, size, outputDir, { resize, apimartResolution: options.apimartResolution });
+      }
+      if (task.fhlApiMode) {
+        return generateImageForWorker(worker, task.prompt, size, outputDir, { resize, fhlApiMode: task.fhlApiMode });
+      }
+      return runSingleTaskWithApiMode(apiMode, {
+        responses: () => generateImage(worker.apiKey, task.prompt, size, outputDir, { resize }),
+        images: () => generateImageViaImages(worker.apiKey, task.prompt, size, outputDir, { resize }),
+      });
+    },
+  });
+
+  const result = report.results[0];
+  if (result?.ok) return { ok: true, ...result, report };
+  return {
+    ok: false,
+    report,
+    error: result?.error || "Generation failed",
+    workerLabel: result?.workerLabel || null,
+    workerName: result?.workerName || null,
+    workerId: result?.workerId || null,
+    routeUsed: result?.routeUsed || null,
+    primaryRoute: result?.primaryRoute || apiMode,
+    fallbackTriggered: !!result?.fallbackTriggered,
+    responsesError: result?.responsesError || null,
+    imagesError: result?.imagesError || null,
+  };
+}
+
+async function runSingleEdit(workers, imagePath, prompt, size, outputDir, options = {}) {
+  const apiMode = normalizeApiMode(options.apiMode) || "images";
+  const fhlApiMode = normalizeFhlApiMode(options.fhlApiMode);
+  const resize = options.resize === true;
+  const sourceGroup = loadSourceImages([imagePath]);
+  if (!sourceGroup.ok) return sourceGroup;
+  const { sources, sourceName } = sourceGroup;
+  console.log(`Loaded ${sources[0].sourceName} (${(sources[0].sourceBuffer.length / 1024 / 1024).toFixed(2)}MB)`);
+
+  const report = await runWorkerTaskQueue(workers, [{
+    prompt,
+    sourceName,
+    fhlApiMode,
+    sources,
+    startText: `Editing ${sourceName}`,
+  }], {
+    concurrency: 1,
+    adaptive: options.adaptive !== false,
+    maxRetries: options.maxRetries ?? MAX_RETRIES,
+    retryDelayMs: options.retryDelayMs ?? RETRY_BACKOFF_MS,
+    outputDir,
+    returnReport: true,
+    onTaskStart: (task, context) => {
+      console.log(`[${context.index + 1}/${context.total}] ${task.startText} via ${workerLabel(context.worker)} [${routeLabelForWorker(context.worker, task.fhlApiMode)}]`);
+    },
+    runTask: async (worker, task) => {
+      if (workerProvider(worker) === PROVIDER_APIMART) {
+        return editImageForWorker(worker, task.sources, prompt, size, outputDir, { resize, apimartResolution: options.apimartResolution });
+      }
+      if (task.fhlApiMode) {
+        return editImageForWorker(worker, task.sources, prompt, size, outputDir, { resize, fhlApiMode: task.fhlApiMode });
+      }
+      return runSingleTaskWithApiMode(apiMode, {
+        responses: () => editImageViaResponsesOnce(worker.apiKey, task.sources, prompt, size, outputDir, { resize }),
+        images: () => editImageViaImagesOnce(worker.apiKey, task.sources, prompt, size, outputDir, { resize }),
+      });
+    },
+  });
+
+  const result = report.results[0];
+  if (result?.ok) return { ok: true, ...result, report, sourceName };
+  return {
+    ok: false,
+    report,
+    sourceName,
+    error: result?.error || "Edit failed",
+    workerLabel: result?.workerLabel || null,
+    workerName: result?.workerName || null,
+    workerId: result?.workerId || null,
+    routeUsed: result?.routeUsed || null,
+    primaryRoute: result?.primaryRoute || apiMode,
+    fallbackTriggered: !!result?.fallbackTriggered,
+    responsesError: result?.responsesError || null,
+    imagesError: result?.imagesError || null,
+  };
+}
+
 async function editImage(workers, imagePaths, prompt, size, outputDir, count = 1, silent = false, options = {}) {
-  const resize = options.resize !== false;
+  const resize = options.resize === true;
+  const fhlApiMode = normalizeFhlApiMode(options.fhlApiMode) || FHL_API_MODE_RESPONSES;
   const paths = Array.isArray(imagePaths) ? imagePaths : [imagePaths];
   const sourceGroup = loadSourceImages(paths);
   if (!sourceGroup.ok) return sourceGroup;
@@ -1583,6 +2999,7 @@ async function editImage(workers, imagePaths, prompt, size, outputDir, count = 1
 
   const tasks = Array.from({ length: count }, (_, index) => ({
     prompt,
+    fhlApiMode,
     sourceName,
     sources,
     saveIndex: count > 1 ? index + 1 : null,
@@ -1600,11 +3017,13 @@ async function editImage(workers, imagePaths, prompt, size, outputDir, count = 1
     outputDir,
     returnReport: true,
     onTaskStart: (task, context) => {
-      console.log(`[${context.index + 1}/${context.total}] ${task.startText} via ${workerLabel(context.worker)}`);
+      console.log(`[${context.index + 1}/${context.total}] ${task.startText} via ${workerLabel(context.worker)} [${routeLabelForWorker(context.worker, task.fhlApiMode)}]`);
     },
-    runTask: async (worker, task) => editImageViaResponsesOnce(worker.apiKey, task.sources, prompt, size, outputDir, {
+    runTask: async (worker, task) => editImageForWorker(worker, task.sources, prompt, size, outputDir, {
       resize,
+      fhlApiMode: task.fhlApiMode,
       saveIndex: task.saveIndex,
+      apimartResolution: options.apimartResolution,
     }),
   });
 
@@ -1633,12 +3052,14 @@ async function runBatch(workers, prompts, size, concurrency, outputDir, options 
     adaptive = true,
     maxRetries = MAX_RETRIES,
     retryDelayMs = RETRY_BACKOFF_MS,
-    resize = true,
+    resize = false,
     returnReport = false,
+    fhlApiMode = FHL_API_MODE_RESPONSES,
   } = options;
 
   const tasks = prompts.map((prompt, index) => ({
     prompt,
+    fhlApiMode,
     startText: isVariation
       ? `Generating variation ${index + 1}/${prompts.length}`
       : `Generating: "${truncateText(prompt)}"`,
@@ -1652,10 +3073,12 @@ async function runBatch(workers, prompts, size, concurrency, outputDir, options 
     outputDir,
     returnReport: true,
     onTaskStart: (task, context) => {
-      console.log(`[${context.index + 1}/${context.total}] ${task.startText} via ${workerLabel(context.worker)}`);
+      console.log(`[${context.index + 1}/${context.total}] ${task.startText} via ${workerLabel(context.worker)} [${routeLabelForWorker(context.worker, task.fhlApiMode)}]`);
     },
-    runTask: async (worker, task) => generateImage(worker.apiKey, task.prompt, size, outputDir, {
+    runTask: async (worker, task) => generateImageForWorker(worker, task.prompt, size, outputDir, {
       resize,
+      fhlApiMode: task.fhlApiMode,
+      apimartResolution: options.apimartResolution,
     }),
   });
 
@@ -1665,18 +3088,20 @@ async function runBatch(workers, prompts, size, concurrency, outputDir, options 
     const successes = report.results.filter((item) => item?.ok);
     const failures = report.results.filter((item) => item && !item.ok);
     for (const [index, result] of successes.entries()) {
-      console.log(`${index + 1}. ${basename(result.path)} ${formatImageResult(result)} via ${result.workerLabel}`);
+      console.log(`${index + 1}. ${basename(result.path)} ${formatImageResult(result)} via ${result.workerLabel}${result.routeLabel ? ` [${result.routeLabel}]` : ""}`);
     }
-    for (const result of failures) console.log(`FAILED via ${result.workerLabel || "n/a"}: ${result.error}`);
+    for (const result of failures) console.log(`FAILED via ${result.workerLabel || "n/a"}${result.routeLabel ? ` [${result.routeLabel}]` : ""}: ${result.error}`);
   } else {
     for (const result of report.results) {
       console.log(`Prompt: "${result.prompt}"`);
       if (result.ok) {
         console.log(`Path: ${result.path}`);
         console.log(`Worker: ${result.workerLabel}`);
+        if (result.routeLabel) console.log(`Route label: ${result.routeLabel}`);
         console.log(`Time: ${(result.elapsed / 1000).toFixed(1)}s, ${formatImageResult(result)}`);
       } else {
         console.log(`Worker: ${result.workerLabel || "n/a"}`);
+        if (result.routeLabel) console.log(`Route label: ${result.routeLabel}`);
         console.log(`FAILED: ${result.error}`);
       }
       console.log("");
@@ -1698,7 +3123,8 @@ async function runBatch(workers, prompts, size, concurrency, outputDir, options 
 }
 
 async function runBatchEdit(workers, imagePaths, prompt, size, concurrency, outputDir, options = {}) {
-  const resize = options.resize !== false;
+  const resize = options.resize === true;
+  const fhlApiMode = normalizeFhlApiMode(options.fhlApiMode) || FHL_API_MODE_RESPONSES;
   const tasks = [];
   for (const imagePath of imagePaths) {
     const sourceGroup = loadSourceImages([imagePath]);
@@ -1708,6 +3134,7 @@ async function runBatchEdit(workers, imagePaths, prompt, size, concurrency, outp
     }
     tasks.push({
       prompt,
+      fhlApiMode,
       sourceName: sourceGroup.sourceName,
       sources: sourceGroup.sources,
       startText: `Editing ${basename(imagePath)}`,
@@ -1722,20 +3149,22 @@ async function runBatchEdit(workers, imagePaths, prompt, size, concurrency, outp
     outputDir,
     returnReport: true,
     onTaskStart: (task, context) => {
-      console.log(`[${context.index + 1}/${context.total}] ${task.startText} via ${workerLabel(context.worker)}`);
+      console.log(`[${context.index + 1}/${context.total}] ${task.startText} via ${workerLabel(context.worker)} [${routeLabelForWorker(context.worker, task.fhlApiMode)}]`);
     },
-    runTask: async (worker, task) => editImageViaResponsesOnce(worker.apiKey, task.sources, prompt, size, outputDir, {
+    runTask: async (worker, task) => editImageForWorker(worker, task.sources, prompt, size, outputDir, {
       resize,
+      fhlApiMode: task.fhlApiMode,
+      apimartResolution: options.apimartResolution,
     }),
   });
 
   console.log("");
   console.log(`Edit prompt: "${prompt}"`);
   for (const result of report.results.filter((item) => item?.ok)) {
-    console.log(`${basename(result.path)} <- ${result.sourceName} ${formatImageResult(result)} via ${result.workerLabel}`);
+    console.log(`${basename(result.path)} <- ${result.sourceName} ${formatImageResult(result)} via ${result.workerLabel}${result.routeLabel ? ` [${result.routeLabel}]` : ""}`);
   }
   for (const result of report.results.filter((item) => item && !item.ok)) {
-    console.log(`FAILED ${result.sourceName}: ${result.error} via ${result.workerLabel || "n/a"}`);
+    console.log(`FAILED ${result.sourceName}: ${result.error} via ${result.workerLabel || "n/a"}${result.routeLabel ? ` [${result.routeLabel}]` : ""}`);
   }
   console.log(`Done: ${report.success}/${report.total} in ${(report.elapsed / 1000).toFixed(1)}s`);
   console.log(`Output: ${outputDir}`);
@@ -2237,6 +3666,7 @@ async function runWorkflowQueuePass(workers, queuedTasks, passOptions) {
     resize,
     fixedSources,
     size,
+    fhlApiMode = FHL_API_MODE_RESPONSES,
     liveResults,
     allTasks,
     metadata,
@@ -2254,7 +3684,7 @@ async function runWorkflowQueuePass(workers, queuedTasks, passOptions) {
     returnReport: true,
     stickyTaskGroups: true,
     onTaskStart: (task, context) => {
-      console.log(`[${label} ${context.index + 1}/${context.total}] ${task.startText} via ${workerLabel(context.worker)}`);
+      console.log(`[${label} ${context.index + 1}/${context.total}] ${task.startText} via ${workerLabel(context.worker)} [${routeLabelForWorker(context.worker, task.fhlApiMode || fhlApiMode)}]`);
     },
     onTaskComplete: (task, result) => {
       liveResults[task.fullIndex] = result;
@@ -2271,8 +3701,10 @@ async function runWorkflowQueuePass(workers, queuedTasks, passOptions) {
           sourceName: basename(task.itemPath),
         };
       }
-      return editImageViaResponsesOnce(worker.apiKey, [...fixedSources, item], task.prompt, size, task.outputDir, {
+      return editImageForWorker(worker, [...fixedSources, item], task.prompt, size, task.outputDir, {
         resize,
+        fhlApiMode: task.fhlApiMode || fhlApiMode,
+        apimartResolution: options.apimartResolution,
         savePath: task.outputPath,
         rawLogPath: `${task.rawLogBasePath}.${repair ? "repair" : "main"}.attempt${context.attempt}.sse.txt`,
       });
@@ -2333,9 +3765,10 @@ async function runWorkflowBatchEdit(workers, options) {
     preset = null,
     size,
     aspect,
+    fhlApiMode = FHL_API_MODE_RESPONSES,
     concurrency = MAX_CONCURRENCY,
     adaptive = true,
-    resize = true,
+    resize = false,
     outputDir,
     dryRun = false,
     repairPasses = WORKFLOW_DEFAULT_REPAIR_PASSES,
@@ -2361,6 +3794,7 @@ async function runWorkflowBatchEdit(workers, options) {
     aspect,
     templateCount: workflowTemplates.length,
     repairPasses,
+    fhlApiMode,
   };
 
   if (dryRun) {
@@ -2394,6 +3828,7 @@ async function runWorkflowBatchEdit(workers, options) {
     resize,
     fixedSources,
     size,
+    fhlApiMode,
     liveResults,
     allTasks: tasks,
     metadata,
@@ -2413,6 +3848,7 @@ async function runWorkflowBatchEdit(workers, options) {
       resize,
       fixedSources,
       size,
+      fhlApiMode,
       liveResults,
       allTasks: tasks,
       metadata,
@@ -2538,9 +3974,10 @@ async function runNailStressTest(workers, options) {
     productDir,
     limit = NAIL_STRESS_DEFAULT_LIMIT,
     size,
+    fhlApiMode = FHL_API_MODE_RESPONSES,
     concurrency = MAX_CONCURRENCY,
     adaptive = true,
-    resize = true,
+    resize = false,
     outputDir,
     dryRun = false,
     resumeExisting = true,
@@ -2636,7 +4073,7 @@ async function runNailStressTest(workers, options) {
     returnReport: true,
     stickyTaskGroups: true,
     onTaskStart: (task, context) => {
-      console.log(`[${context.index + 1}/${context.total}] ${task.startText} via ${workerLabel(context.worker)}`);
+      console.log(`[${context.index + 1}/${context.total}] ${task.startText} via ${workerLabel(context.worker)} [${routeLabelForWorker(context.worker, fhlApiMode)}]`);
     },
     onTaskComplete: (task, result, context) => {
       liveResults[task.fullIndex] = result;
@@ -2652,8 +4089,10 @@ async function runNailStressTest(workers, options) {
           sourceName: basename(task.productPath),
         };
       }
-      return editImageViaResponsesOnce(worker.apiKey, [persona, product], task.prompt, size, task.outputDir, {
+      return editImageForWorker(worker, [persona, product], task.prompt, size, task.outputDir, {
         resize,
+        fhlApiMode,
+        apimartResolution: options.apimartResolution,
         savePath: task.outputPath,
         rawLogPath: `${task.rawLogBasePath}.attempt${context.attempt}.sse.txt`,
       });
@@ -2862,6 +4301,318 @@ async function runEditResponsesSelfTest() {
   return 0;
 }
 
+async function runImagesGenerateSelfTest() {
+  console.log("Images generate self-test: payload shape and b64_json extraction.");
+  const payload = buildImagesGenerationBody("mock generate prompt", "2048x1152");
+  const payloadOk = payload.model === IMAGE_MODEL
+    && typeof payload.prompt === "string"
+    && payload.prompt.includes("mock generate prompt")
+    && payload.n === 1
+    && payload.size === "2048x1152"
+    && payload.quality === "auto"
+    && payload.output_format === "png"
+    && payload.response_format === "b64_json"
+    && !Object.prototype.hasOwnProperty.call(payload, "stream")
+    && !Object.prototype.hasOwnProperty.call(payload, "partial_images");
+
+  const pngB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+  const extracted = extractImagesFromImagesApiResponse({
+    created: 0,
+    data: [{ b64_json: pngB64 }],
+  });
+  const outputDir = resolveOutputDir(join(tmpdir(), "fhl-image-gen-self-test"));
+  const saved = extracted.ok ? saveBase64Image(extracted.images[0], outputDir, "self_test_images_generate") : null;
+  const savedOk = extracted.ok && !!saved?.path && existsSync(saved.path) && saved.width === 1 && saved.height === 1;
+
+  if (!payloadOk || !savedOk) {
+    console.error("Images generate self-test FAILED.");
+    console.error(JSON.stringify({
+      payloadOk,
+      extracted,
+      savedOk,
+      saved,
+    }, null, 2));
+    return 1;
+  }
+
+  console.log("Images generate self-test OK.");
+  console.log(`Saved: ${saved.path}`);
+  return 0;
+}
+
+async function runImagesEditSelfTest() {
+  console.log("Images edit self-test: multipart shape and b64_json extraction.");
+  const sources = [
+    {
+      sourceName: "mock-a.png",
+      sourceBuffer: Buffer.from("mock-source-a"),
+      mimeType: "image/png",
+      ext: "png",
+    },
+    {
+      sourceName: "mock-b.jpg",
+      sourceBuffer: Buffer.from("mock-source-b"),
+      mimeType: "image/jpeg",
+      ext: "jpg",
+    },
+  ];
+  const form = buildImagesEditForm("mock edit prompt", "1152x2048", sources);
+  const formKeys = Array.from(form.keys());
+  const imagePrimary = form.get("image");
+  const imageSecondary = form.getAll("image[]");
+  const payloadOk = formKeys.includes("image")
+    && formKeys.includes("image[]")
+    && form.get("prompt")?.toString().includes("mock edit prompt")
+    && form.get("model") === IMAGE_MODEL
+    && form.get("n") === "1"
+    && form.get("size") === "1152x2048"
+    && form.get("quality") === "auto"
+    && form.get("output_format") === "png"
+    && form.get("response_format") === "b64_json"
+    && imagePrimary
+    && imageSecondary.length === 1;
+
+  const pngB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+  const extracted = extractImagesFromImagesApiResponse({
+    created: 0,
+    data: [{ b64_json: pngB64 }],
+  });
+  const outputDir = resolveOutputDir(join(tmpdir(), "fhl-image-gen-self-test"));
+  const saved = extracted.ok ? saveBase64Image(extracted.images[0], outputDir, "self_test_images_edit") : null;
+  const savedOk = extracted.ok && !!saved?.path && existsSync(saved.path) && saved.width === 1 && saved.height === 1;
+
+  if (!payloadOk || !savedOk) {
+    console.error("Images edit self-test FAILED.");
+    console.error(JSON.stringify({
+      payloadOk,
+      formKeys,
+      imageSecondaryCount: imageSecondary.length,
+      extracted,
+      savedOk,
+      saved,
+    }, null, 2));
+    return 1;
+  }
+
+  console.log("Images edit self-test OK.");
+  console.log(`Saved: ${saved.path}`);
+  return 0;
+}
+
+async function runRouteFallbackSelfTest() {
+  console.log("Route fallback self-test: auto should switch Responses -> Images when eligible.");
+
+  let imagesCalled = 0;
+  const autoFallback = await runSingleTaskWithApiMode("auto", {
+    responses: async () => ({ ok: false, error: "HTTP 502: Cloudflare Bad Gateway", elapsed: 10 }),
+    images: async () => {
+      imagesCalled += 1;
+      return { ok: true, elapsed: 20, path: "mock.png", fileSize: "0.01MB", width: 1, height: 1, dimensions: "1x1" };
+    },
+  });
+
+  let authFallbackCalled = false;
+  const authNoFallback = await runSingleTaskWithApiMode("auto", {
+    responses: async () => ({ ok: false, error: "HTTP 401: invalid api key", elapsed: 10 }),
+    images: async () => {
+      authFallbackCalled = true;
+      return { ok: true, elapsed: 20 };
+    },
+  });
+
+  let forcedImagesFallbackCalled = false;
+  const forcedImages = await runSingleTaskWithApiMode("images", {
+    responses: async () => {
+      forcedImagesFallbackCalled = true;
+      return { ok: true, elapsed: 10 };
+    },
+    images: async () => ({ ok: false, error: "HTTP 502: Cloudflare Bad Gateway", elapsed: 20 }),
+  });
+
+  const autoFallbackOk = autoFallback.ok
+    && autoFallback.routeUsed === "images"
+    && autoFallback.fallbackTriggered === true
+    && autoFallback.responsesError === "HTTP 502: Cloudflare Bad Gateway"
+    && imagesCalled === 1;
+  const authNoFallbackOk = !authNoFallback.ok
+    && authNoFallback.routeUsed === "responses"
+    && authNoFallback.fallbackTriggered === false
+    && authFallbackCalled === false;
+  const forcedImagesOk = !forcedImages.ok
+    && forcedImages.primaryRoute === "images"
+    && forcedImages.routeUsed === "images"
+    && forcedImagesFallbackCalled === false;
+
+  if (!autoFallbackOk || !authNoFallbackOk || !forcedImagesOk) {
+    console.error("Route fallback self-test FAILED.");
+    console.error(JSON.stringify({
+      autoFallback,
+      imagesCalled,
+      authNoFallback,
+      authFallbackCalled,
+      forcedImages,
+      forcedImagesFallbackCalled,
+    }, null, 2));
+    return 1;
+  }
+
+  console.log("Route fallback self-test OK.");
+  return 0;
+}
+
+function redactApimartRequestBody(body) {
+  const imageUrls = Array.isArray(body?.image_urls) ? body.image_urls : [];
+  const redacted = { ...body };
+  if (imageUrls.length > 0) {
+    redacted.image_urls = imageUrls.map((value, index) => {
+      const text = String(value || "");
+      const mime = text.match(/^data:([^;,]+)[;,]/i)?.[1] || null;
+      return {
+        index: index + 1,
+        type: mime ? "data-url" : (/^https?:\/\//i.test(text) ? "url" : "unknown"),
+        mimeType: mime,
+        length: text.length,
+        value: mime ? `data:${mime};base64,<redacted>` : "<redacted>",
+      };
+    });
+  } else {
+    delete redacted.image_urls;
+  }
+  return redacted;
+}
+
+async function runApimartRoundtripStep(apiKey, label, body, outputPath) {
+  const start = Date.now();
+  const log = {
+    label,
+    prompt: body.prompt,
+    request: redactApimartRequestBody(body),
+    outputPath,
+    ok: false,
+    taskId: null,
+    status: null,
+    elapsedMs: null,
+    dimensions: null,
+    fileSize: null,
+    error: null,
+  };
+
+  const submitted = await submitApimartImageTask(apiKey, body);
+  if (!submitted.ok) {
+    log.elapsedMs = Date.now() - start;
+    log.error = submitted.error;
+    return { ok: false, log, error: submitted.error };
+  }
+  log.taskId = submitted.taskId;
+
+  const completed = await waitForApimartImage(apiKey, submitted.taskId, start);
+  log.status = completed.status || null;
+  if (!completed.ok) {
+    log.elapsedMs = Date.now() - start;
+    log.error = completed.error;
+    return { ok: false, log, error: completed.error };
+  }
+
+  const downloaded = await downloadApimartImagePayload(completed.payload);
+  if (!downloaded.ok) {
+    log.elapsedMs = Date.now() - start;
+    log.error = downloaded.error;
+    return { ok: false, log, error: downloaded.error };
+  }
+
+  const saved = downloaded.base64
+    ? saveBase64ImageToPath(downloaded.base64, outputPath, null)
+    : savePngBuffer(outputPath, downloaded.buffer, null);
+  if (!saved) {
+    log.elapsedMs = Date.now() - start;
+    log.error = "APIMart image result could not be saved";
+    return { ok: false, log, error: log.error };
+  }
+
+  log.ok = true;
+  log.elapsedMs = Date.now() - start;
+  log.dimensions = saved.dimensions || null;
+  log.fileSize = saved.fileSize || null;
+  log.width = saved.width || null;
+  log.height = saved.height || null;
+  return { ok: true, log, ...saved, taskId: submitted.taskId, status: completed.status || null };
+}
+
+async function runApimartRoundtripTest(config, flags = {}) {
+  const workers = getConfiguredWorkers(config, { provider: PROVIDER_APIMART, requireEnabled: true });
+  const worker = workers[0];
+  if (!worker) {
+    console.error("ERROR: No enabled APIMart worker is configured. Run --set-apimart-key <key> first.");
+    return 1;
+  }
+  const resolution = normalizeApimartResolution(flags.apimartResolution || flags.apimartTestResolution) || APIMART_RESOLUTION;
+
+  const outputDir = buildApimartRoundtripOutputRoot(flags.outputDir, resolution);
+  const aspect = "1:1";
+  const requestedSize = aspect;
+  const textPrompt = "钓鱼的小羊";
+  const editPrompt = "图中小羊钓起一条鱼大鱼";
+  const textPath = join(outputDir, "01_text_to_image_raw.png");
+  const editPath = join(outputDir, "02_image_to_image_raw.png");
+  const logPath = join(outputDir, "request-log.json");
+  const log = {
+    workflow: "apimart-roundtrip-test",
+    provider: PROVIDER_APIMART,
+    model: APIMART_MODEL,
+    resolution,
+    officialFallback: false,
+    endpoint: APIMART_GENERATIONS_URL,
+    aspect,
+    requestedSize,
+    worker: {
+      id: worker.id,
+      name: worker.name,
+      keyPreview: previewKey(worker.apiKey),
+    },
+    outputDir,
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    steps: [],
+  };
+
+  console.log("APIMart roundtrip test");
+  console.log(`Output: ${outputDir}`);
+  console.log(`Resolution: ${resolution}`);
+  console.log(`Step 1 prompt: ${textPrompt}`);
+
+  const textBody = buildApimartImageBody(textPrompt, requestedSize, [], { resolution });
+  const textResult = await runApimartRoundtripStep(worker.apiKey, "text-to-image", textBody, textPath);
+  log.steps.push(textResult.log);
+  if (!textResult.ok) {
+    log.finishedAt = new Date().toISOString();
+    saveTextArtifact(logPath, JSON.stringify(log, null, 2));
+    console.error(`Text-to-image failed: ${textResult.error}`);
+    console.error(`Log: ${logPath}`);
+    return 1;
+  }
+
+  console.log(`Step 1 saved: ${textResult.path} (${formatImageResult(textResult)})`);
+  console.log(`Step 2 prompt: ${editPrompt}`);
+
+  const sourceBuffer = readFileSync(textResult.path);
+  const sourceDataURL = imageDataURLFromBuffer(sourceBuffer, "image/png");
+  const editBody = buildApimartImageBody(editPrompt, requestedSize, [sourceDataURL], { resolution });
+  const editResult = await runApimartRoundtripStep(worker.apiKey, "image-to-image", editBody, editPath);
+  log.steps.push(editResult.log);
+  log.finishedAt = new Date().toISOString();
+  saveTextArtifact(logPath, JSON.stringify(log, null, 2));
+
+  if (!editResult.ok) {
+    console.error(`Image-to-image failed: ${editResult.error}`);
+    console.error(`Log: ${logPath}`);
+    return 1;
+  }
+
+  console.log(`Step 2 saved: ${editResult.path} (${formatImageResult(editResult)})`);
+  console.log(`Request log: ${logPath}`);
+  return 0;
+}
+
 function parseArgs(argv) {
   const args = { prompts: [], flags: {} };
   let i = 0;
@@ -2869,8 +4620,15 @@ function parseArgs(argv) {
     const value = argv[i];
     if (value === "--get-config") args.flags.getConfig = true;
     else if (value === "--list-workers") args.flags.listWorkers = true;
+    else if (value === "--provider" && argv[i + 1]) args.flags.provider = argv[++i];
+    else if (value === "--fhl-api-mode" && argv[i + 1]) args.flags.fhlApiMode = argv[++i];
+    else if (value === "--set-fhl-api-mode" && argv[i + 1]) args.flags.setFhlApiMode = argv[++i];
+    else if (value === "--set-default-provider" && argv[i + 1]) args.flags.setDefaultProvider = argv[++i];
+    else if (value === "--clear-default-provider") args.flags.clearDefaultProvider = true;
     else if (value === "--set-key" && argv[i + 1]) args.flags.setKey = argv[++i];
+    else if (value === "--set-apimart-key" && argv[i + 1]) args.flags.setApimartKey = argv[++i];
     else if (value === "--add-worker-key" && argv[i + 1]) args.flags.addWorkerKey = argv[++i];
+    else if (value === "--add-apimart-key" && argv[i + 1]) args.flags.addApimartKey = argv[++i];
     else if (value === "--worker-name" && argv[i + 1]) args.flags.workerName = argv[++i];
     else if (value === "--set-worker-key" && argv[i + 2]) {
       args.flags.setWorkerKey = { worker: argv[++i], key: argv[++i] };
@@ -2888,6 +4646,7 @@ function parseArgs(argv) {
     else if (value === "--repeat" && argv[i + 1]) args.flags.repeat = Number.parseInt(argv[++i], 10);
     else if (value === "--limit" && argv[i + 1]) args.flags.limit = Number.parseInt(argv[++i], 10);
     else if (value === "--output-dir" && argv[i + 1]) args.flags.outputDir = argv[++i];
+    else if (value === "--api-mode" && argv[i + 1]) args.flags.apiMode = argv[++i];
     else if (value === "--concurrency" && argv[i + 1]) args.flags.concurrency = Number.parseInt(argv[++i], 10);
     else if (value === "--adaptive") args.flags.adaptive = true;
     else if (value === "--no-adaptive") args.flags.adaptive = false;
@@ -2933,39 +4692,70 @@ function parseArgs(argv) {
     else if (value === "--self-test-adaptive") args.flags.selfTestAdaptive = true;
     else if (value === "--self-test-workers") args.flags.selfTestAdaptive = true;
     else if (value === "--self-test-edit-responses") args.flags.selfTestEditResponses = true;
+    else if (value === "--self-test-images-generate") args.flags.selfTestImagesGenerate = true;
+    else if (value === "--self-test-images-edit") args.flags.selfTestImagesEdit = true;
+    else if (value === "--self-test-route-fallback") args.flags.selfTestRouteFallback = true;
     else if (value === "--self-test-workflow") args.flags.selfTestWorkflow = true;
+    else if (value === "--apimart-roundtrip-test") args.flags.apimartRoundtripTest = true;
+    else if (value === "--fhl-multiref-diagnostic") args.flags.fhlMultirefDiagnostic = true;
+    else if (value === "--diagnostic-suite" && argv[i + 1]) args.flags.diagnosticSuite = argv[++i];
+    else if (value === "--field-mode" && argv[i + 1]) args.flags.fieldMode = argv[++i];
+    else if (value === "--field-modes" && argv[i + 1]) args.flags.fieldModes = argv[++i];
+    else if (value === "--ref-counts" && argv[i + 1]) args.flags.refCounts = argv[++i];
+    else if (value === "--upload-max-edge" && argv[i + 1]) args.flags.uploadMaxEdge = argv[++i];
+    else if (value === "--upload-max-edges" && argv[i + 1]) args.flags.uploadMaxEdges = argv[++i];
+    else if (value === "--diagnostic-attempts" && argv[i + 1]) args.flags.diagnosticAttempts = Number.parseInt(argv[++i], 10);
+    else if (value === "--diagnostic-timeout-ms" && argv[i + 1]) args.flags.diagnosticTimeoutMs = Number.parseInt(argv[++i], 10);
+    else if (value === "--diagnostic-combination-mode" && argv[i + 1]) args.flags.diagnosticCombinationMode = argv[++i];
+    else if (value === "--diagnostic-parallel") args.flags.diagnosticParallel = true;
+    else if (value === "--diagnostic-sequential") args.flags.diagnosticParallel = false;
+    else if (value === "--apimart-resolution" && argv[i + 1]) args.flags.apimartResolution = argv[++i];
+    else if (value === "--apimart-test-resolution" && argv[i + 1]) args.flags.apimartTestResolution = argv[++i];
+    else if (value === "--internal") args.flags.internal = true;
+    else if (value === "--help-internal") {
+      args.flags.help = true;
+      args.flags.internal = true;
+    }
     else if (value === "--help" || value === "-h") args.flags.help = true;
     i++;
   }
   return args;
 }
 
-function printUsage() {
+function printUsage(options = {}) {
+  if (options.internal === true) {
+    printInternalUsage();
+    return;
+  }
   console.log(`FHL Image Gen
 
 CONFIG
   --get-config
   --list-workers
-  --set-key <key>
+  --set-key <key>                         save/update the default FHL worker
   --add-worker-key <key> [--worker-name <name>]
   --set-worker-key <worker> <key>
   --remove-worker <worker>
   --enable-worker <worker>
   --disable-worker <worker>
+  --set-fhl-api-mode responses|images     persist the default FHL route
   --set-quick-mode --ratio R --count 1..${MAX_GENERATION_COUNT}
   --set-batch-mode --ratio R --concurrency 1..${MAX_CONCURRENCY}
 
 GENERATE
-  --prompt "..." [--ratio R|--aspect R] [--count 1..${MAX_GENERATION_COUNT}] [--no-resize]
+  --prompt "..." [--ratio R|--aspect R] [--api-mode auto|responses|images] [--fhl-api-mode responses|images] [--count 1..${MAX_GENERATION_COUNT}] [--resize]
   --prompt "..." --repeat 1..${MAX_REPEAT} [--concurrency 1..${MAX_CONCURRENCY}] [--adaptive|--no-adaptive]
-  --batch prompts.json [--ratio R|--aspect R] [--concurrency N] [--no-resize]
-  --batch-inline "prompt 1" "prompt 2" ... [--ratio R|--aspect R] [--concurrency N] [--no-resize]
+  --batch prompts.json [--ratio R|--aspect R] [--concurrency N] [--resize]
+  --batch-inline "prompt 1" "prompt 2" ... [--ratio R|--aspect R] [--concurrency N] [--resize]
 
 EDIT
-  --edit --image path.png --prompt "..." [--ratio R|--aspect R] [--count 1..${MAX_EDIT_COUNT}] [--concurrency N]
-  --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R] [--count 1..${MAX_EDIT_COUNT}] [--concurrency N]    combine all sources in one Responses edit request
+  --edit --image path.png --prompt "..." [--ratio R|--aspect R] [--api-mode auto|responses|images] [--fhl-api-mode responses|images] [--count 1..${MAX_EDIT_COUNT}] [--concurrency N]
+  --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R] [--count 1..${MAX_EDIT_COUNT}] [--concurrency N]
   --batch-edit --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R] [--concurrency N]
-  image-to-image route is fixed to Responses API; --legacy-edit and --edit-api images are disabled
+  FHL defaults to Images API because the upstream Responses route may be unstable
+  If Images fails, try --api-mode responses for single tasks or --fhl-api-mode responses for provider-level routing
+  Edit concurrency recommendation: 10-worker edit concurrency is validated for single-reference edits only; keep multi-reference edits low-concurrency
+  --legacy-edit and --edit-api images stay disabled as legacy entry points
 
 WORKFLOW BATCH EDIT
   --workflow-batch-edit --fixed-ref ref.png --item-dir dir --templates templates.json [--limit ${WORKFLOW_DEFAULT_LIMIT}] [--aspect R] [--concurrency 1..${MAX_CONCURRENCY}] [--repair-passes 0..5|--no-repair] [--dry-run]
@@ -2981,86 +4771,245 @@ TOOLS
   --self-test-adaptive
   --self-test-workers
   --self-test-edit-responses
+  --self-test-images-generate
+  --self-test-images-edit
+  --self-test-route-fallback
   --self-test-workflow
 
 DEFAULTS
   API root: ${API_ROOT}
   responses text model: ${TEXT_MODEL}
   image model: ${IMAGE_MODEL}
-  edit API: responses only
-  request quality: fixed ${FIXED_REQUEST_QUALITY}
+  default provider: fhl
+  FHL single-task routing: default images; use --api-mode responses or --api-mode auto only when needed
+  request quality: public FHL preset stays fixed ${FIXED_REQUEST_QUALITY}
+  saved image policy: always keep the raw upstream PNG; --resize only creates a separate __resized_WxH copy and never overwrites the raw file
   output: ~/Pictures/fhl-image-gen
-  worker pool: enabled, one worker per task, auto parallel for independent tasks, max workers ${MAX_WORKERS}
+  worker pool: enabled, max configured workers ${MAX_WORKERS}
   adaptive: on, concurrency ${DEFAULTS.concurrency}, retries ${MAX_RETRIES}, worker cooldown ${DEFAULT_WORKER_COOLDOWN_MS / 1000}s
   notice: ${FHL_SIZE_LIMIT_NOTICE}
   workflow batch edit: generic fixed refs + variable item refs + user templates, auto resume and repair passes
   nail stress test: compatibility preset for ${WORKFLOW_NAIL_PRESET}; do not assume product type in generic workflow
 
 RATIOS
-  ${supportedRatioText()}
+  FHL 2K generate stable: ${supportedRatioText({ provider: PROVIDER_FHL, operation: "generate", quality: "2K" })}
+  FHL 2K edit stable: ${supportedRatioText({ provider: PROVIDER_FHL, operation: "edit", quality: "2K" })}
   aliases: square=1:1, landscape=4:3, portrait=3:4
-  disabled after repeated real FHL 502 tests: 5:4, 4:5, 3:1, 1:3
 
 SIZE MATRIX
-  2K: 1:1 2048x2048, 3:2 2048x1360, 2:3 1360x2048, 4:3 2048x1536, 3:4 1536x2048, 16:9 2048x1152, 9:16 1152x2048, 2:1 2048x1024, 1:2 1024x2048, 7:4 2208x1264, 4:7 1264x2208
+  2K matrix: 1:1 2048x2048, 3:2 2048x1360, 2:3 1360x2048, 4:3 2048x1536, 3:4 1536x2048, 5:4 2048x1632, 4:5 1632x2048, 16:9 2048x1152, 9:16 1152x2048, 2:1 2048x1024, 1:2 1024x2048, 3:1 2048x688, 1:3 688x2048, 7:4 2208x1264, 4:7 1264x2208
   --size WxH is disabled. Use only --ratio/--aspect from the fixed supported list above.`);
 }
 
-function resolveGenerationParams(flags, modeConfig) {
+function printInternalUsage() {
+  console.log(`FHL Image Gen Internal Help
+
+PUBLIC DEFAULT
+  User-facing configuration and generation stay FHL-only. Do not mention the backup provider in normal user setup.
+
+INTERNAL BACKUP PROVIDER
+  --provider apimart
+  --set-apimart-key <key>
+  --add-apimart-key <key> [--worker-name <name>]
+  --set-default-provider apimart
+  --clear-default-provider
+  --apimart-resolution 1k|2k|4k
+  --get-config --internal
+  --list-workers --internal
+
+INTERNAL BACKUP GENERATE
+  --provider apimart --prompt "..." [--ratio R|--aspect R] [--apimart-resolution 1k|2k|4k]
+  --provider apimart --edit --image path.png --prompt "..." [--ratio R|--aspect R] [--apimart-resolution 1k|2k|4k]
+
+INTERNAL DIAGNOSTICS
+  --apimart-roundtrip-test [--apimart-resolution 1k|2k|4k]
+  --apimart-test-resolution 1k|2k|4k remains as a compatibility alias for diagnostics only
+  --fhl-multiref-diagnostic --prompt "..." --image a.png --image b.png [...]
+    [--diagnostic-suite fields|upload|concurrency]
+    [--field-mode mixed|repeat-image|array]
+    [--field-modes mixed,repeat-image,array]
+    [--ref-counts 2,3,5,10]
+    [--upload-max-edge native|1536|1024|768]
+    [--upload-max-edges native,1536,1024,768]
+    [--diagnostic-combination-mode first|sliding]
+    [--diagnostic-timeout-ms 180000]
+    [--diagnostic-parallel|--diagnostic-sequential]
+
+BACKUP PROVIDER CONTRACT
+  Endpoint: ${APIMART_GENERATIONS_URL}
+  Model: ${APIMART_MODEL}
+  Default resolution: ${APIMART_RESOLUTION}
+  Text-to-image: do not send image_urls
+  Image-to-image: send image_urls with data:image/...;base64 references
+  Do not use gpt-image-2-official, and do not use /v1/images/edits
+  1:1 actual tested sizes: 1k=1254x1254, 2k=2048x2048, 4k=2880x2880
+  Treat image-to-image as reference generation/fusion, not guaranteed precise local editing.`);
+}
+
+function resolveGenerationParams(flags, modeConfig, options = {}) {
   const requestedQuality = flags.quality || modeConfig?.quality || DEFAULTS.quality;
   const quality = normalizeQuality(requestedQuality);
+  const provider = normalizeProvider(options.provider) || PROVIDER_FHL;
+  const operation = normalizeOperation(options.operation);
+  const apimartResolution = normalizeApimartResolution(options.apimartResolution || flags.apimartResolution) || APIMART_RESOLUTION;
+  const sizeMatrixQuality = provider === PROVIDER_APIMART ? apimartResolution.toUpperCase() : quality;
   if (shouldWarnFixedQuality(requestedQuality)) {
-    console.warn(`NOTICE: FHL Codex image generation is fixed to ${FIXED_REQUEST_QUALITY}; ignoring requested quality="${requestedQuality}". ${FHL_SIZE_LIMIT_NOTICE}`);
+    if (provider === PROVIDER_APIMART) {
+      console.warn(`NOTICE: Internal backup provider uses resolution="${apimartResolution}"; ignoring requested quality="${requestedQuality}". ${APIMART_COST_NOTICE}`);
+    } else {
+      console.warn(`NOTICE: FHL Codex image generation is fixed to ${FIXED_REQUEST_QUALITY}; ignoring requested quality="${requestedQuality}". ${FHL_SIZE_LIMIT_NOTICE}`);
+    }
   }
 
   if (flags.size) {
-    console.error(`ERROR: --size is disabled in this plugin. Use only --aspect/--ratio. Supported ratios: ${supportedRatioText()}. Disabled ratios: 5:4, 4:5, 3:1, 1:3.`);
+    console.error(`ERROR: --size is disabled in this plugin. Use only --aspect/--ratio. Supported ${operation} ratios: ${supportedRatioText({ provider, operation, quality: sizeMatrixQuality })}.`);
     process.exit(1);
   }
 
   const requestedRatio = flags.aspect ?? flags.ratio ?? modeConfig?.ratio ?? DEFAULTS.ratio;
   let ratio = normalizeRatio(requestedRatio);
-  if (isDisabledRatio(ratio)) {
-    console.error(`ERROR: Ratio="${requestedRatio}" is disabled in this plugin because repeated real FHL tests returned upstream 502 for 5:4, 4:5, 3:1, and 1:3. Use one of: ${supportedRatioText()}.`);
+  if (!isRatioSupportedForRequest(ratio, { provider, operation, quality: sizeMatrixQuality })) {
+    const supported = supportedRatioText({ provider, operation, quality: sizeMatrixQuality });
+    if (provider === PROVIDER_FHL) {
+      console.error(`ERROR: Ratio="${requestedRatio}" is not in the tested FHL ${sizeMatrixQuality} ${operation} matrix. Supported ratios: ${supported}.`);
+    } else {
+      console.error(`ERROR: Ratio="${requestedRatio}" is not supported for ${operation}. Supported ratios: ${supported}.`);
+    }
     process.exit(1);
   }
-  const size = resolveSize(quality, ratio);
+  const size = resolveSizeFromMatrix(sizeMatrixQuality, ratio);
   if (!size) {
-    console.error(`ERROR: Invalid ratio="${requestedRatio}". Supported ratios: ${supportedRatioText()}. Aliases: square, landscape, portrait.`);
+    console.error(`ERROR: Invalid ratio="${requestedRatio}". Supported ratios: ${supportedRatioText({ provider, operation, quality: sizeMatrixQuality })}. Aliases: square, landscape, portrait.`);
     process.exit(1);
   }
-  return { quality, ratio, size, explicitSize: false, requestedSize: flags.size || null };
+  return { quality, ratio, size, sizeMatrixQuality, explicitSize: false, requestedSize: flags.size || null };
+}
+
+function didUserExplicitlySetApiMode(flags) {
+  return flags.apiMode != null;
+}
+
+function explicitNonResponsesApiMode(flags, apiMode) {
+  return didUserExplicitlySetApiMode(flags) && apiMode !== "responses";
+}
+
+function printRouteSummary(result) {
+  if (result?.routeLabel) console.log(`Route label: ${result.routeLabel}`);
+  if (!result?.primaryRoute) return;
+  console.log(`Route: ${result.routeUsed || result.primaryRoute}`);
+  console.log(`Primary route: ${result.primaryRoute}`);
+  console.log(`Fallback triggered: ${result.fallbackTriggered ? "yes" : "no"}`);
+  if (result.responsesError) console.log(`Responses error: ${result.responsesError}`);
+  if (result.imagesError) console.log(`Images error: ${result.imagesError}`);
 }
 
 async function main() {
   const { prompts, flags } = parseArgs(process.argv.slice(2));
   const config = loadConfig();
+  const apiMode = flags.apiMode == null ? null : normalizeApiMode(flags.apiMode);
+  const requestedProvider = flags.provider != null ? normalizeProvider(flags.provider) : null;
+  const requestedFhlApiMode = flags.fhlApiMode != null ? normalizeFhlApiMode(flags.fhlApiMode) : null;
+  const requestedSetFhlApiMode = flags.setFhlApiMode != null ? normalizeFhlApiMode(flags.setFhlApiMode) : null;
+  const requestedApimartResolution = normalizeApimartResolution(flags.apimartResolution) || null;
+
+  if (flags.apiMode != null && !apiMode) {
+    console.error(`ERROR: Invalid --api-mode "${flags.apiMode}". Use responses, images, or auto.`);
+    process.exit(1);
+  }
+  if (flags.provider != null && !requestedProvider) {
+    console.error(`ERROR: Invalid provider "${flags.provider}". Use fhl.`);
+    process.exit(1);
+  }
+  if (flags.fhlApiMode != null && !requestedFhlApiMode) {
+    console.error(`ERROR: Invalid FHL API mode "${flags.fhlApiMode}". Use responses or images.`);
+    process.exit(1);
+  }
+  if (flags.setFhlApiMode != null && !requestedSetFhlApiMode) {
+    console.error(`ERROR: Invalid FHL API mode "${flags.setFhlApiMode}". Use responses or images.`);
+    process.exit(1);
+  }
+  if (flags.apimartResolution != null && !normalizeApimartResolution(flags.apimartResolution)) {
+    console.error(`ERROR: Invalid internal backup resolution "${flags.apimartResolution}". Use 1k, 2k, or 4k.`);
+    process.exit(1);
+  }
+  if (flags.apimartTestResolution != null && !normalizeApimartResolution(flags.apimartTestResolution)) {
+    console.error(`ERROR: Invalid APIMart test resolution "${flags.apimartTestResolution}". Use 1k, 2k, or 4k.`);
+    process.exit(1);
+  }
 
   if (flags.getConfig) {
-    console.log(JSON.stringify(buildConfigSummary(config), null, 2));
+    console.log(JSON.stringify(buildConfigSummary(config, { internal: flags.internal === true }), null, 2));
     return;
   }
 
   if (flags.listWorkers) {
-    printWorkerList(config);
+    printWorkerList(config, { internal: flags.internal === true });
+    return;
+  }
+
+  if (flags.setFhlApiMode) {
+    config.fhlApiMode = requestedSetFhlApiMode;
+    saveConfig(config);
+    console.log(`FHL API mode saved: ${requestedSetFhlApiMode}`);
+    return;
+  }
+
+  if (flags.setDefaultProvider) {
+    const provider = normalizeProvider(flags.setDefaultProvider);
+    if (!provider) {
+      console.error(`ERROR: Invalid provider "${flags.setDefaultProvider}". Use fhl.`);
+      process.exit(1);
+    }
+    config.defaultProvider = provider;
+    saveConfig(config);
+    console.log(`Default provider saved: ${provider}`);
+    return;
+  }
+
+  if (flags.clearDefaultProvider) {
+    if ("defaultProvider" in config) delete config.defaultProvider;
+    saveConfig(config);
+    console.log("Default provider cleared.");
     return;
   }
 
   if (flags.setKey) {
     const workers = getConfiguredWorkers(config);
-    if (workers.length > 1) {
-      console.error("ERROR: --set-key only works when zero or one worker is configured. Use --add-worker-key or --set-worker-key <worker> <key> for multi-worker setups.");
+    const fhlWorkers = workers.filter((worker) => workerProvider(worker) === PROVIDER_FHL);
+    if (fhlWorkers.length > 1) {
+      console.error("ERROR: --set-key only works when zero or one FHL worker is configured. Use --add-worker-key or --set-worker-key <worker> <key> for multi-worker FHL setups.");
       process.exit(1);
     }
-    if (workers.length === 0) {
-      config.workers = [createWorkerRecord(flags.setKey, DEFAULT_WORKER_NAME, [])];
+    if (fhlWorkers.length === 0) {
+      config.workers = [...workers, createWorkerRecord(flags.setKey, DEFAULT_WORKER_NAME, workers, PROVIDER_FHL)];
     } else {
-      config.workers = config.workers.map((worker, index) => (index === 0
+      config.workers = config.workers.map((worker) => (worker.id === fhlWorkers[0].id
         ? { ...worker, apiKey: String(flags.setKey).trim() }
         : worker));
     }
     saveConfig(config);
-    console.log(`FHL API worker saved: ${previewKey(flags.setKey)} (${config.workers[0].name})`);
+    const savedWorker = getConfiguredWorkers(config).find((worker) => workerProvider(worker) === PROVIDER_FHL);
+    console.log(`FHL API worker saved: ${previewKey(flags.setKey)} (${savedWorker?.name || DEFAULT_WORKER_NAME})`);
+    return;
+  }
+
+  if (flags.setApimartKey) {
+    const workers = getConfiguredWorkers(config);
+    const apimartWorkers = workers.filter((worker) => workerProvider(worker) === PROVIDER_APIMART);
+    if (apimartWorkers.length > 1) {
+      console.error("ERROR: --set-apimart-key only works when zero or one APIMart worker is configured. Use --add-apimart-key or --set-worker-key <worker> <key> for multi-worker APIMart setups.");
+      process.exit(1);
+    }
+    if (apimartWorkers.length === 0) {
+      config.workers = [...workers, createWorkerRecord(flags.setApimartKey, flags.workerName || "apimart", workers, PROVIDER_APIMART)];
+    } else {
+      config.workers = config.workers.map((worker) => (worker.id === apimartWorkers[0].id
+        ? { ...worker, apiKey: String(flags.setApimartKey).trim() }
+        : worker));
+    }
+    saveConfig(config);
+    const savedWorker = getConfiguredWorkers(config).find((worker) => workerProvider(worker) === PROVIDER_APIMART);
+    console.log(`APIMart API worker saved: ${previewKey(flags.setApimartKey)} (${savedWorker?.name || "apimart"})`);
     return;
   }
 
@@ -3075,10 +5024,29 @@ async function main() {
       console.error(`ERROR: This API key is already configured on ${duplicate.name} [${duplicate.id}].`);
       process.exit(1);
     }
-    const worker = createWorkerRecord(flags.addWorkerKey, flags.workerName, workers);
+    const worker = createWorkerRecord(flags.addWorkerKey, flags.workerName, workers, PROVIDER_FHL);
     config.workers = [...workers, worker];
     saveConfig(config);
-    console.log(`Worker added: ${worker.name} [${worker.id}] key=${previewKey(worker.apiKey)}`);
+    console.log(`Worker added: ${worker.name} [${worker.id}] provider=${worker.provider} key=${previewKey(worker.apiKey)}`);
+    return;
+  }
+
+  if (flags.addApimartKey) {
+    const workers = getConfiguredWorkers(config);
+    if (workers.length >= MAX_WORKERS) {
+      console.error(`ERROR: Worker pool supports up to ${MAX_WORKERS} API workers. Remove or disable an existing worker before adding another one.`);
+      process.exit(1);
+    }
+    const duplicate = findDuplicateWorkerKey(workers, flags.addApimartKey);
+    if (duplicate) {
+      console.error(`ERROR: This API key is already configured on ${duplicate.name} [${duplicate.id}].`);
+      process.exit(1);
+    }
+    const apimartCount = workers.filter((worker) => workerProvider(worker) === PROVIDER_APIMART).length;
+    const worker = createWorkerRecord(flags.addApimartKey, flags.workerName || `apimart-${apimartCount + 1}`, workers, PROVIDER_APIMART);
+    config.workers = [...workers, worker];
+    saveConfig(config);
+    console.log(`APIMart worker added: ${worker.name} [${worker.id}] key=${previewKey(worker.apiKey)}`);
     return;
   }
 
@@ -3147,9 +5115,13 @@ async function main() {
     }
     const ratio = normalizeRatio(flags.aspect ?? flags.ratio ?? previous.ratio ?? DEFAULTS.ratio);
     const count = clampInteger(flags.count ?? previous.count, 1, MAX_GENERATION_COUNT, DEFAULTS.count);
+    if (!isRatioSupportedForRequest(ratio, { provider: PROVIDER_FHL, operation: "generate", quality })) {
+      console.error(`ERROR: Invalid ratio="${ratio}". Supported generation ratios: ${supportedRatioText({ provider: PROVIDER_FHL, operation: "generate", quality })}.`);
+      process.exit(1);
+    }
     const size = resolveSize(quality, ratio);
     if (!size) {
-      console.error(`ERROR: Invalid ratio="${ratio}". Supported ratios: ${supportedRatioText()}.`);
+      console.error(`ERROR: Invalid ratio="${ratio}". Supported generation ratios: ${supportedRatioText({ provider: PROVIDER_FHL, operation: "generate", quality })}.`);
       process.exit(1);
     }
     config.quickMode = { quality, ratio, count };
@@ -3168,9 +5140,13 @@ async function main() {
     }
     const ratio = normalizeRatio(flags.aspect ?? flags.ratio ?? previous.ratio ?? DEFAULTS.ratio);
     const concurrency = clampInteger(flags.concurrency ?? previous.concurrency, 1, MAX_CONCURRENCY, DEFAULTS.concurrency);
+    if (!isRatioSupportedForRequest(ratio, { provider: PROVIDER_FHL, operation: "generate", quality })) {
+      console.error(`ERROR: Invalid ratio="${ratio}". Supported generation ratios: ${supportedRatioText({ provider: PROVIDER_FHL, operation: "generate", quality })}.`);
+      process.exit(1);
+    }
     const size = resolveSize(quality, ratio);
     if (!size) {
-      console.error(`ERROR: Invalid ratio="${ratio}". Supported ratios: ${supportedRatioText()}.`);
+      console.error(`ERROR: Invalid ratio="${ratio}". Supported generation ratios: ${supportedRatioText({ provider: PROVIDER_FHL, operation: "generate", quality })}.`);
       process.exit(1);
     }
     config.batchMode = { quality, ratio, concurrency };
@@ -3180,8 +5156,9 @@ async function main() {
   }
 
   if (flags.resolveSize) {
-    const { quality, ratio, size, explicitSize } = resolveGenerationParams(flags, config.quickMode);
-    console.log(JSON.stringify({ quality, ratio, size, explicitSize }, null, 2));
+    const provider = requestedProvider || normalizeProvider(config.defaultProvider) || PROVIDER_FHL;
+    const { quality, ratio, size, explicitSize, sizeMatrixQuality } = resolveGenerationParams(flags, config.quickMode, { provider, operation: "generate", apimartResolution: requestedApimartResolution });
+    console.log(JSON.stringify({ provider, quality, ratio, size, sizeMatrixQuality, explicitSize }, null, 2));
     return;
   }
 
@@ -3195,28 +5172,73 @@ async function main() {
     return;
   }
 
+  if (flags.selfTestImagesGenerate) {
+    process.exitCode = await runImagesGenerateSelfTest();
+    return;
+  }
+
+  if (flags.selfTestImagesEdit) {
+    process.exitCode = await runImagesEditSelfTest();
+    return;
+  }
+
+  if (flags.selfTestRouteFallback) {
+    process.exitCode = await runRouteFallbackSelfTest();
+    return;
+  }
+
   if (flags.selfTestWorkflow) {
     process.exitCode = await runWorkflowSelfTest();
     return;
   }
 
-  if (flags.help || (prompts.length === 0 && !flags.batchFile && !flags.edit && !flags.nailStressTest && !flags.workflowBatchEdit)) {
-    printUsage();
+  if (flags.apimartRoundtripTest) {
+    process.exitCode = await runApimartRoundtripTest(config, flags);
     return;
   }
 
-  if (isWorkerLimitExceeded(config)) {
-    console.error(workerLimitErrorMessage(getConfiguredWorkers(config).length));
+  if (flags.fhlMultirefDiagnostic) {
+    process.exitCode = await runFhlMultirefDiagnostic(config, flags, prompts);
+    return;
+  }
+
+  if (flags.help || (prompts.length === 0 && !flags.batchFile && !flags.edit && !flags.nailStressTest && !flags.workflowBatchEdit)) {
+    printUsage({ internal: flags.internal === true });
+    return;
+  }
+
+  const providerForRun = requestedProvider || normalizeProvider(config.defaultProvider) || PROVIDER_FHL;
+  const effectiveFhlApiMode = resolveFhlApiMode(config, flags);
+
+  if (isWorkerLimitExceeded(config, { provider: providerForRun })) {
+    console.error(workerLimitErrorMessage(getConfiguredWorkers(config, { provider: providerForRun }).length));
     process.exit(1);
   }
 
-  const configuredWorkers = getConfiguredWorkers(config);
+  if (providerForRun === PROVIDER_APIMART && flags.fhlApiMode != null) {
+    console.error("ERROR: --fhl-api-mode only applies when --provider fhl is used.");
+    process.exit(1);
+  }
+  if (providerForRun === PROVIDER_APIMART && flags.apiMode != null) {
+    console.error("ERROR: --api-mode is only supported for FHL single-task compatibility. APIMart does not use --api-mode.");
+    process.exit(1);
+  }
+
+  const configuredWorkers = getConfiguredWorkers(config, { provider: providerForRun });
   if (configuredWorkers.filter((worker) => worker.enabled !== false).length === 0) {
-    console.error("ERROR: No enabled FHL API worker is configured. Run --set-key <key> or --add-worker-key <key> first.");
+    const providerText = providerForRun === PROVIDER_APIMART ? "APIMart" : "FHL";
+    const setupHint = providerForRun === PROVIDER_APIMART
+      ? "Run --set-apimart-key <key> or --add-apimart-key <key> first."
+      : "Run --set-key <key> or --add-worker-key <key> first.";
+    console.error(`ERROR: No enabled ${providerText} API worker is configured. ${setupHint}`);
     process.exit(1);
   }
 
   if (flags.workflowBatchEdit) {
+    if (explicitNonResponsesApiMode(flags, apiMode)) {
+      console.error("ERROR: --api-mode only applies to single FHL tasks. For workflow use --fhl-api-mode responses|images.");
+      process.exit(1);
+    }
     if (!flags.itemDir) {
       console.error("ERROR: --workflow-batch-edit requires --item-dir <dir>.");
       process.exit(1);
@@ -3229,7 +5251,7 @@ async function main() {
       process.exit(1);
     }
     const workflowAspect = flags.aspect ?? flags.ratio ?? "9:16";
-    const { ratio, size } = resolveGenerationParams({ ...flags, aspect: workflowAspect }, { quality: FIXED_REQUEST_QUALITY, ratio: workflowAspect });
+    const { ratio, size } = resolveGenerationParams({ ...flags, aspect: workflowAspect }, { quality: FIXED_REQUEST_QUALITY, ratio: workflowAspect }, { provider: providerForRun, operation: "edit", apimartResolution: requestedApimartResolution });
     const limitExplicit = flags.limit != null;
     const limit = clampInteger(flags.limit, 1, 1000, WORKFLOW_DEFAULT_LIMIT);
     const concurrency = clampInteger(flags.concurrency ?? MAX_CONCURRENCY, 1, MAX_CONCURRENCY, Math.min(MAX_CONCURRENCY, DEFAULTS.concurrency));
@@ -3243,9 +5265,11 @@ async function main() {
       preset: flags.preset || null,
       size,
       aspect: ratio,
+      fhlApiMode: effectiveFhlApiMode,
+      apimartResolution: requestedApimartResolution,
       concurrency,
       adaptive: flags.adaptive !== false,
-      resize: flags.resize !== false,
+      resize: flags.resize === true,
       outputDir: flags.outputDir,
       dryRun: !!flags.dryRun,
       repairPasses,
@@ -3255,6 +5279,10 @@ async function main() {
   }
 
   if (flags.nailStressTest) {
+    if (explicitNonResponsesApiMode(flags, apiMode)) {
+      console.error("ERROR: --api-mode only applies to single FHL tasks. For nail stress test use --fhl-api-mode responses|images.");
+      process.exit(1);
+    }
     if (!flags.personaPath) {
       console.error("ERROR: --nail-stress-test requires --persona <path>.");
       process.exit(1);
@@ -3271,15 +5299,17 @@ async function main() {
     }
     const limit = clampInteger(flags.limit, 1, 1000, NAIL_STRESS_DEFAULT_LIMIT);
     const concurrency = clampInteger(flags.concurrency ?? MAX_CONCURRENCY, 1, MAX_CONCURRENCY, Math.min(MAX_CONCURRENCY, DEFAULTS.concurrency));
-    const { size } = resolveGenerationParams({ ...flags, aspect: "9:16" }, { quality: FIXED_REQUEST_QUALITY, ratio: "9:16" });
+    const { size } = resolveGenerationParams({ ...flags, aspect: "9:16" }, { quality: FIXED_REQUEST_QUALITY, ratio: "9:16" }, { provider: providerForRun, operation: "edit", apimartResolution: requestedApimartResolution });
     const result = await runNailStressTest(configuredWorkers, {
       personaPath: flags.personaPath,
       productDir: flags.productDir,
       limit,
       size,
+      fhlApiMode: effectiveFhlApiMode,
+      apimartResolution: requestedApimartResolution,
       concurrency,
       adaptive: flags.adaptive !== false,
-      resize: flags.resize !== false,
+      resize: flags.resize === true,
       outputDir: flags.outputDir,
       dryRun: !!flags.dryRun,
     });
@@ -3304,25 +5334,46 @@ async function main() {
       process.exit(1);
     }
     if (flags.unsupportedEditRoute) {
-      console.error("ERROR: Image-to-image is fixed to Responses API with input_image blocks. --legacy-edit and --edit-api images are disabled in this plugin.");
+      console.error("ERROR: --legacy-edit and --edit-api images are legacy-disabled in this plugin. Use --api-mode images for single FHL edit tests or --fhl-api-mode images for provider-level FHL routing.");
       process.exit(1);
     }
-    const { size } = resolveGenerationParams(flags, config.quickMode);
+    const { size } = resolveGenerationParams(flags, config.quickMode, { provider: providerForRun, operation: "edit", apimartResolution: requestedApimartResolution });
     if (images.length > 1 && flags.batchEdit) {
+      if (explicitNonResponsesApiMode(flags, apiMode)) {
+        console.error("ERROR: --api-mode only applies to single FHL tasks. For batch edit use --fhl-api-mode responses|images.");
+        process.exit(1);
+      }
       const concurrency = clampInteger(flags.concurrency ?? config.batchMode?.concurrency, 1, MAX_CONCURRENCY, DEFAULTS.concurrency);
       process.exitCode = await runBatchEdit(configuredWorkers, images, prompts[0], size, concurrency, outputDir, {
         adaptive: flags.adaptive !== false,
-        resize: flags.resize !== false,
+        fhlApiMode: effectiveFhlApiMode,
+        apimartResolution: requestedApimartResolution,
+        resize: flags.resize === true,
       });
       return;
     }
     const count = clampInteger(flags.count, 1, MAX_EDIT_COUNT, 1);
+    const isSingleImagesApiEligible = providerForRun === PROVIDER_FHL && images.length === 1 && count === 1 && !flags.batchEdit && !requestedFhlApiMode;
+    if (!isSingleImagesApiEligible && explicitNonResponsesApiMode(flags, apiMode)) {
+      console.error("ERROR: --api-mode currently supports only single-image single-task FHL edit in v0.2.0. Use --fhl-api-mode for provider-level FHL routing.");
+      process.exit(1);
+    }
     const concurrency = clampInteger(flags.concurrency ?? config.batchMode?.concurrency ?? count, 1, MAX_CONCURRENCY, DEFAULTS.concurrency);
-    const result = await editImage(configuredWorkers, images, prompts[0], size, outputDir, count, false, {
-      adaptive: flags.adaptive !== false,
-      concurrency,
-      resize: flags.resize !== false,
-    });
+    const result = isSingleImagesApiEligible
+      ? await runSingleEdit(configuredWorkers, images[0], prompts[0], size, outputDir, {
+        adaptive: flags.adaptive !== false,
+        resize: flags.resize === true,
+        fhlApiMode: requestedFhlApiMode || null,
+        apimartResolution: requestedApimartResolution,
+        apiMode: apiMode || "images",
+      })
+      : await editImage(configuredWorkers, images, prompts[0], size, outputDir, count, false, {
+        adaptive: flags.adaptive !== false,
+        concurrency,
+        fhlApiMode: effectiveFhlApiMode,
+        apimartResolution: requestedApimartResolution,
+        resize: flags.resize === true,
+      });
     if (!result.ok) {
       if (result.results?.length > 0) {
         console.error("Partial edit successes:");
@@ -3331,6 +5382,7 @@ async function main() {
         }
       }
       console.error(`Edit failed: ${result.error}`);
+      if (count === 1) printRouteSummary(result);
       if (result.report) printWorkerStats(result.report);
       process.exitCode = 1;
       return;
@@ -3344,6 +5396,7 @@ async function main() {
       console.log(`Path: ${result.path}`);
       console.log(`Size: ${formatImageResult(result)}`);
       console.log(`Worker: ${result.workerLabel}`);
+      printRouteSummary(result);
     }
     console.log(`Source: ${result.sourceName}`);
     console.log(`Time: ${(result.elapsed / 1000).toFixed(1)}s`);
@@ -3353,9 +5406,13 @@ async function main() {
 
   const isBatch = !!flags.batchFile || !!flags.batchInline;
   const modeConfig = isBatch ? config.batchMode : config.quickMode;
-  const { size } = resolveGenerationParams(flags, modeConfig);
+  const { size } = resolveGenerationParams(flags, modeConfig, { provider: providerForRun, operation: "generate", apimartResolution: requestedApimartResolution });
 
   if (flags.batchFile) {
+    if (explicitNonResponsesApiMode(flags, apiMode)) {
+      console.error("ERROR: --api-mode only applies to single FHL tasks. For batch use --fhl-api-mode responses|images.");
+      process.exit(1);
+    }
     const raw = readFileSync(flags.batchFile, "utf8");
     const parsed = JSON.parse(raw);
     const batchPrompts = Array.isArray(parsed) ? parsed : parsed?.prompts;
@@ -3370,11 +5427,17 @@ async function main() {
     const concurrency = clampInteger(flags.concurrency ?? config.batchMode?.concurrency, 1, MAX_CONCURRENCY, DEFAULTS.concurrency);
     process.exit(await runBatch(configuredWorkers, batchPrompts.map(String), size, concurrency, outputDir, {
       adaptive: flags.adaptive !== false,
-      resize: flags.resize !== false,
+      fhlApiMode: effectiveFhlApiMode,
+      apimartResolution: requestedApimartResolution,
+      resize: flags.resize === true,
     }));
   }
 
   if (flags.batchInline) {
+    if (explicitNonResponsesApiMode(flags, apiMode)) {
+      console.error("ERROR: --api-mode only applies to single FHL tasks. For batch-inline use --fhl-api-mode responses|images.");
+      process.exit(1);
+    }
     if (prompts.length > MAX_BATCH_PROMPTS) {
       console.error(`ERROR: Batch generation supports up to ${MAX_BATCH_PROMPTS} prompts.`);
       process.exit(1);
@@ -3382,7 +5445,9 @@ async function main() {
     const concurrency = clampInteger(flags.concurrency ?? config.batchMode?.concurrency, 1, MAX_CONCURRENCY, DEFAULTS.concurrency);
     process.exit(await runBatch(configuredWorkers, prompts, size, concurrency, outputDir, {
       adaptive: flags.adaptive !== false,
-      resize: flags.resize !== false,
+      fhlApiMode: effectiveFhlApiMode,
+      apimartResolution: requestedApimartResolution,
+      resize: flags.resize === true,
     }));
   }
 
@@ -3391,18 +5456,41 @@ async function main() {
     ? clampInteger(flags.repeat, 1, MAX_REPEAT, DEFAULTS.count)
     : clampInteger(flags.count ?? config.quickMode?.count, 1, MAX_GENERATION_COUNT, DEFAULTS.count);
   if (total > 1) {
+    if (explicitNonResponsesApiMode(flags, apiMode)) {
+      console.error("ERROR: --api-mode currently covers only one single FHL generation task. Use --fhl-api-mode for provider-level FHL routing.");
+      process.exit(1);
+    }
     const concurrency = clampInteger(flags.concurrency ?? config.batchMode?.concurrency, 1, MAX_CONCURRENCY, DEFAULTS.concurrency);
     process.exit(await runBatch(configuredWorkers, Array(total).fill(prompt), size, concurrency, outputDir, {
       adaptive: flags.adaptive !== false,
+      fhlApiMode: effectiveFhlApiMode,
+      apimartResolution: requestedApimartResolution,
       isVariation: true,
-      resize: flags.resize !== false,
+      resize: flags.resize === true,
     }));
   }
 
-  process.exit(await runBatch(configuredWorkers, [prompt], size, 1, outputDir, {
+  const result = await runSingleGenerate(configuredWorkers, prompt, size, outputDir, {
     adaptive: flags.adaptive !== false,
-    resize: flags.resize !== false,
-  }));
+    resize: flags.resize === true,
+    fhlApiMode: requestedFhlApiMode || null,
+    apimartResolution: requestedApimartResolution,
+    apiMode: apiMode || "images",
+  });
+  if (!result.ok) {
+    console.error(`Generation failed: ${result.error}`);
+    printRouteSummary(result);
+    if (result.report) printWorkerStats(result.report);
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`Prompt: "${prompt}"`);
+  console.log(`Path: ${result.path}`);
+  console.log(`Size: ${formatImageResult(result)}`);
+  console.log(`Worker: ${result.workerLabel}`);
+  printRouteSummary(result);
+  console.log(`Time: ${(result.elapsed / 1000).toFixed(1)}s`);
+  if (result.report) printWorkerStats(result.report);
 }
 
 main().catch((error) => {

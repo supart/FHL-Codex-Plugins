@@ -1,5 +1,27 @@
 # FHL Codex Plugins
 
+## v0.2.0 发布说明
+
+v0.2.0 默认使用 FHL Images API 主链路，并保留 Responses 作为显式切换路线。
+
+当前规则固定为：
+
+- 单张文生图支持 `--api-mode responses|images|auto`
+- 单图图生图支持 `--api-mode responses|images|auto`
+- 默认单任务行为是 `images`，因为 Responses 上游可能无法稳定返回图片结果
+- `--count > 1`、`--repeat`、`--batch`、`--batch-inline`、`--batch-edit`、`--workflow-batch-edit`、`--nail-stress-test`、多参考图 edit 默认也使用 FHL Images API；需要排查时可显式切换 `--fhl-api-mode responses`
+- `--legacy-edit` 和 `--edit-api images` 继续保留为旧入口报错，不作为新链路使用方式
+
+示例：
+
+```powershell
+node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --prompt "在河边钓鱼的小狗" --aspect 1:1 --api-mode images
+node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --prompt "在河边钓鱼的小狗" --aspect 1:1 --api-mode responses
+node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --edit --image "C:\path\input.png" --prompt "将这张图改成 9:16 竖版海报" --aspect 9:16 --api-mode images
+```
+
+如果 Images API 跑不通，可以尝试显式切回 Responses 路线。
+
 给 Codex 用的 FHL 插件 marketplace。
 
 当前提供插件：`fhl-image-gen`
@@ -23,7 +45,7 @@ codex plugin add fhl-image-gen@fhl-plugins
 - marketplace 展示名：`FHL Plugins`
 - 当前插件：`fhl-image-gen@fhl-plugins`
 
-`fhl-image-gen` 是一个基于 FHL Responses API 的 Codex 生图插件，支持：
+`fhl-image-gen` 是一个基于 FHL Images API 默认链路、并保留 Responses 显式切换路线的 Codex 生图插件，支持：
 
 - 文生图
 - 单图图生图
@@ -183,7 +205,7 @@ node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --batch prompts.json
 
 ### 5. 单图图生图
 
-图生图默认固定走 Responses API：
+图生图默认走 FHL Images API：
 
 ```powershell
 node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --edit --image "C:\path\input.png" --prompt "把这张图改成 9:16 竖版海报" --aspect 9:16
@@ -191,13 +213,13 @@ node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --edit --image "C:\path\
 
 ### 6. 多参考图图生图
 
-多张参考图会按顺序作为多个 `input_image` 一起上传到同一个 Responses 请求中，不会先拼图：
+多张参考图会按顺序上传到同一个 FHL 图生图请求中，不会先拼图：
 
 ```powershell
 node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --edit --image "C:\path\one.png" --image "C:\path\two.png" --image "C:\path\three.png" --prompt "将这些参考图组合成一个完整场景，保留主要特征并生成高质量海报" --aspect 16:9
 ```
 
-当前单次多参考图上传上限为 `10` 张。
+当前单次多参考图上传上限保留为 `10` 张，用于内部诊断和手动重试。生产使用建议控制在 `1..5` 张参考图，并采用顺序或低并发。`6..10` 张属于重任务/实验范围，容易遇到 FHL 上游 `524` 或网络超时。10 worker 图生图并发目前只验证适合单参考图；2 张及以上参考图的合成请求不建议高并发，如果需要大量出图，优先分组生成或顺序运行。
 
 ### 7. 按源图分别批量图生图
 
@@ -243,7 +265,7 @@ node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --workflow-batch-edit --
 工作流特性：
 
 - 每个变量图会展开为一个独立任务组
-- 每个模板都是一次独立 Responses edit 请求
+- 每个模板都是一次独立 FHL edit 请求
 - 支持断点续跑
 - 支持自动补洞
 - 会输出 `manifest.json`、`summary.csv`、`failures.json`、`sessions.json`
@@ -311,15 +333,17 @@ node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --workflow-batch-edit --
 
 当前真实行为如下：
 
-- 文生图默认走 `POST https://www.fhl.mom/v1/responses`
-- 图生图默认也走 `POST https://www.fhl.mom/v1/responses`
+- 文生图默认走 `POST https://www.fhl.mom/v1/images/generations`
+- 图生图默认走 `POST https://www.fhl.mom/v1/images/edits`
+- Responses 路线仍保留为显式切换能力：`--api-mode responses` 或 `--fhl-api-mode responses`
 - 文本模型固定为 `gpt-5.5`
 - 图像工具模型固定为 `gpt-image-2`
-- 图生图使用 `input_text + input_image` 的 Responses 方式
+- 默认图生图使用 FHL Images API 的图片上传方式；Responses 路线才使用 `input_text + input_image`
 - 多参考图图生图是多图上传，不是拼图
+- 10 worker 图生图并发目前只建议用于单参考图；多参考图图生图生产建议 `1..5` 张参考图并低并发运行，`6..10` 张只作为重任务/实验范围保留
 - 不支持任意 `--size` 自定义
 - 当前插件固定按 2K 比例矩阵请求
-- legacy Images API 编辑链路已禁用，不作为默认能力
+- legacy edit 入口仍保持禁用；默认图生图走当前 FHL Images API 链路
 
 插件内保留如下说明，便于理解当前上游限制：
 
@@ -388,7 +412,7 @@ node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --get-config
 - 图片路径存在且可读取
 - 图片格式正常
 - 你使用的是 `--edit`
-- 你没有尝试切回 legacy Images API
+- 你没有尝试显式切换另一条 FHL 路线，例如 `--api-mode responses` 或 `--fhl-api-mode responses`
 
 ## 仓库与插件信息
 
@@ -397,7 +421,7 @@ node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --get-config
 - marketplace 展示名：`FHL Plugins`
 - 插件标识：`fhl-image-gen@fhl-plugins`
 - 插件目录：`./plugins/fhl-image-gen`
-- 当前版本：`0.1.1`
+- 当前版本：`0.2.0`
 
 如果你只想记住两条命令，就记这两行：
 
