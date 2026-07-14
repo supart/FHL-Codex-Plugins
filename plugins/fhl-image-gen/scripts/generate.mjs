@@ -136,8 +136,9 @@ const DEFAULTS = {
   count: 1,
   concurrency: 3,
 };
-const FIXED_REQUEST_QUALITY = "2K";
-const FHL_SIZE_LIMIT_NOTICE = "Current public FHL requests stay on the tested 2K preset. Real 1K/2K/4K ratio results are recorded in the help text and skill.";
+const DEFAULT_FHL_REQUEST_QUALITY = "2K";
+const FHL_PUBLIC_QUALITIES = new Set(["2K", "4K"]);
+const FHL_SIZE_LIMIT_NOTICE = "FHL defaults to the tested 2K preset. Use --quality 4K only when the user explicitly requests 4K.";
 const WORKER_ID_PREFIX = "worker-";
 const DEFAULT_WORKER_NAME = "default";
 const DEFAULT_WORKER_COOLDOWN_MS = 60_000;
@@ -211,15 +212,15 @@ function normalizeFhlApiMode(mode) {
 }
 
 function configuredFhlApiMode(config) {
-  return normalizeFhlApiMode(config?.fhlApiMode) || FHL_API_MODE_IMAGES;
+  return FHL_API_MODE_IMAGES;
 }
 
 function resolveFhlApiMode(config, flags = {}) {
-  return normalizeFhlApiMode(flags?.fhlApiMode) || configuredFhlApiMode(config);
+  return FHL_API_MODE_IMAGES;
 }
 
 function fhlModeLabel(mode) {
-  return `FHL/${normalizeFhlApiMode(mode) || FHL_API_MODE_RESPONSES}`;
+  return `FHL/${FHL_API_MODE_IMAGES}`;
 }
 
 function providerLabel(provider) {
@@ -336,8 +337,8 @@ function normalizeConfigShape(config) {
   if (source.fhlApiMode != null) {
     const fhlApiMode = normalizeFhlApiMode(source.fhlApiMode);
     if (fhlApiMode) {
-      normalized.fhlApiMode = fhlApiMode;
-      if (source.fhlApiMode !== fhlApiMode) changed = true;
+      normalized.fhlApiMode = FHL_API_MODE_IMAGES;
+      if (source.fhlApiMode !== FHL_API_MODE_IMAGES) changed = true;
     } else {
       delete normalized.fhlApiMode;
       changed = true;
@@ -492,12 +493,13 @@ function printWorkerList(config, options = {}) {
 }
 
 function normalizeQuality(quality) {
-  return FIXED_REQUEST_QUALITY;
+  const normalized = String(quality || "").trim().toUpperCase();
+  return FHL_PUBLIC_QUALITIES.has(normalized) ? normalized : DEFAULT_FHL_REQUEST_QUALITY;
 }
 
 function shouldWarnFixedQuality(quality) {
   const normalized = String(quality || "").trim().toUpperCase();
-  return normalized && normalized !== FIXED_REQUEST_QUALITY;
+  return normalized && !FHL_PUBLIC_QUALITIES.has(normalized);
 }
 
 function normalizeRatio(ratio) {
@@ -525,7 +527,7 @@ function normalizeOperation(operation) {
 function testedQualityLabel(quality) {
   const normalized = String(quality || "").trim().toUpperCase();
   if (normalized === "1K" || normalized === "2K" || normalized === "4K") return normalized;
-  return FIXED_REQUEST_QUALITY;
+  return DEFAULT_FHL_REQUEST_QUALITY;
 }
 
 function supportedRatiosForRequest(options = {}) {
@@ -1667,22 +1669,24 @@ async function generateImageViaImages(apiKey, prompt, size, outputDir, options =
       },
       body: JSON.stringify(buildImagesGenerationBody(prompt, size)),
     }, REQUEST_TIMEOUT_MS);
-    if (!res.ok) return { ok: false, elapsed: Date.now() - start, error: await parseErrorResponse(res), routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES) };
+    if (!res.ok) return { ok: false, status: res.status, elapsed: Date.now() - start, error: await parseErrorResponse(res), routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES) };
 
     const raw = await res.text();
     let parsed = null;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      return { ok: false, elapsed: Date.now() - start, error: "Images API returned invalid JSON", routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES) };
+      return { ok: false, status: res.status, elapsed: Date.now() - start, error: "Images API returned invalid JSON", routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES) };
     }
     const extracted = extractImagesFromImagesApiResponse(parsed);
-    if (!extracted.ok) return { ok: false, elapsed: Date.now() - start, error: extracted.error, routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES) };
+    if (!extracted.ok) return { ok: false, status: res.status, elapsed: Date.now() - start, error: extracted.error, routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES) };
 
-    const saved = saveBase64Image(extracted.images[0], outputDir, "img", null, resize ? size : null);
+    const saved = options.savePath
+      ? saveBase64ImageToPath(extracted.images[0], options.savePath, resize ? size : null)
+      : saveBase64Image(extracted.images[0], outputDir, "img", null, resize ? size : null);
     const elapsed = Date.now() - start;
-    if (!saved) return { ok: false, elapsed, error: "No b64_json image in Images API response", routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES) };
-    return { ok: true, elapsed, routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES), ...saved };
+    if (!saved) return { ok: false, status: res.status, elapsed, error: "No b64_json image in Images API response", routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES) };
+    return { ok: true, status: res.status, elapsed, routeLabel: fhlModeLabel(FHL_API_MODE_IMAGES), ...saved };
   } catch (error) {
     return {
       ok: false,
@@ -2027,6 +2031,211 @@ function writeFhlDiagnosticReports(outputRoot, manifest) {
   return { manifestPath, summaryPath, failuresPath };
 }
 
+function ratioFileSlug(ratio) {
+  return String(ratio || "").replace(/:/g, "x").replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+function ratioStressActualRatio(width, height) {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || height <= 0) return null;
+  return width / height;
+}
+
+function ratioStressError(requestSize, width, height) {
+  const requested = parseSizeForAspect(requestSize);
+  const actualRatio = ratioStressActualRatio(width, height);
+  if (!requested || actualRatio == null) return null;
+  const requestedRatio = requested.width / requested.height;
+  if (!requestedRatio) return null;
+  return Math.abs(actualRatio / requestedRatio - 1);
+}
+
+function classifyRatioStressResult(task, result) {
+  if (!result?.ok) return "failed";
+  const requested = parseSizeForAspect(task.requestSize);
+  if (requested && result.width === requested.width && result.height === requested.height) {
+    return "exact_4k_supported";
+  }
+  const error = ratioStressError(task.requestSize, result.width, result.height);
+  if (error != null && error <= 0.03) return "aspect_only_supported";
+  return "dimension_mismatch";
+}
+
+function buildFhl4kRatioStressOutputRoot(userDir) {
+  return resolveOutputDir(userDir || join(homedir(), "Pictures", "fhl-image-gen", `fhl_4k_ratio_stress_${timestamp()}`));
+}
+
+function buildFhl4kRatioStressTasks(prompt, outputRoot) {
+  return Object.entries(SIZE_MATRIX["4K"]).map(([ratio, requestSize], index) => {
+    const sequence = String(index + 1).padStart(2, "0");
+    const slug = ratioFileSlug(ratio);
+    return {
+      index: index + 1,
+      prompt,
+      quality: "4K",
+      ratio,
+      requestSize,
+      outputPath: join(outputRoot, `${sequence}_${slug}_${requestSize}.png`),
+      startText: `4K ratio ${ratio} (${requestSize})`,
+    };
+  });
+}
+
+function ratioStressRecord(task, result) {
+  const error = ratioStressError(task.requestSize, result?.width, result?.height);
+  const actualRatio = ratioStressActualRatio(result?.width, result?.height);
+  const fileBytes = result?.path && existsSync(result.path) ? readFileSync(result.path).length : null;
+  return {
+    index: task.index,
+    ratio: task.ratio,
+    requestSize: task.requestSize,
+    prompt: task.prompt,
+    classification: classifyRatioStressResult(task, result),
+    ok: !!result?.ok,
+    status: result?.status || null,
+    workerId: result?.workerId || null,
+    workerName: result?.workerName || null,
+    workerLabel: result?.workerLabel || null,
+    elapsedMs: result?.elapsed || 0,
+    seconds: Number(((result?.elapsed || 0) / 1000).toFixed(1)),
+    attempts: result?.attempts || 0,
+    retries: result?.retries || 0,
+    path: result?.path || null,
+    fileSize: result?.fileSize || null,
+    bytes: fileBytes,
+    actualWidth: result?.width || null,
+    actualHeight: result?.height || null,
+    actualSize: result?.dimensions || null,
+    actualRatio: actualRatio == null ? null : Number(actualRatio.toFixed(6)),
+    ratioErrorPercent: error == null ? null : Number((error * 100).toFixed(3)),
+    error: result?.error || null,
+  };
+}
+
+function writeFhl4kRatioStressReports(outputRoot, tasks, report, prompt) {
+  mkdirSync(outputRoot, { recursive: true });
+  const records = tasks.map((task, index) => ratioStressRecord(task, report.results[index] || null));
+  const counts = records.reduce((acc, item) => {
+    acc[item.classification] = (acc[item.classification] || 0) + 1;
+    return acc;
+  }, {});
+  const manifest = {
+    createdAt: new Date().toISOString(),
+    provider: PROVIDER_FHL,
+    route: "images_generations",
+    model: IMAGE_MODEL,
+    quality: "4K",
+    prompt,
+    concurrency: report.initialConcurrency,
+    peakConcurrency: report.peakConcurrency,
+    elapsedMs: report.elapsed,
+    counts,
+    workerStats: report.workerStats,
+    results: records,
+  };
+  const manifestPath = join(outputRoot, "manifest.json");
+  writeTextFileAtomic(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+  const summaryPath = join(outputRoot, "summary.csv");
+  writeCsvFile(summaryPath, [
+    ["index", "ratio", "requestSize", "classification", "ok", "status", "worker", "seconds", "attempts", "retries", "actualSize", "actualWidth", "actualHeight", "actualRatio", "ratioErrorPercent", "fileSize", "bytes", "path", "error"],
+    ...records.map((item) => [
+      item.index,
+      item.ratio,
+      item.requestSize,
+      item.classification,
+      item.ok,
+      item.status,
+      item.workerLabel || item.workerName || item.workerId || "",
+      item.seconds,
+      item.attempts,
+      item.retries,
+      item.actualSize || "",
+      item.actualWidth || "",
+      item.actualHeight || "",
+      item.actualRatio || "",
+      item.ratioErrorPercent == null ? "" : item.ratioErrorPercent,
+      item.fileSize || "",
+      item.bytes || "",
+      item.path || "",
+      item.error || "",
+    ]),
+  ]);
+  const failuresPath = join(outputRoot, "failures.json");
+  writeTextFileAtomic(failuresPath, JSON.stringify(records.filter((item) => item.classification !== "exact_4k_supported"), null, 2), "utf8");
+  return { manifestPath, summaryPath, failuresPath, manifest, records };
+}
+
+async function runFhl4kRatioStressTest(config, flags, prompts) {
+  if (prompts.length === 0) {
+    console.error("ERROR: --fhl-4k-ratio-stress-test requires --prompt <text>.");
+    return 1;
+  }
+  const workers = getConfiguredWorkers(config, { provider: PROVIDER_FHL }).filter((worker) => worker.enabled !== false && worker.apiKey);
+  if (workers.length === 0) {
+    console.error("ERROR: No enabled FHL worker is configured.");
+    return 1;
+  }
+  const outputRoot = buildFhl4kRatioStressOutputRoot(flags.outputDir);
+  const tasks = buildFhl4kRatioStressTasks(prompts[0], outputRoot);
+  const concurrency = clampInteger(flags.concurrency ?? MAX_CONCURRENCY, 1, MAX_CONCURRENCY, MAX_CONCURRENCY);
+
+  console.log("FHL 4K ratio stress test");
+  console.log(`Output: ${outputRoot}`);
+  console.log(`Prompt: ${prompts[0]}`);
+  console.log(`Route: FHL Images API`);
+  console.log(`Quality: 4K`);
+  console.log(`Workers: ${workers.length}`);
+  console.log(`Concurrency: ${concurrency}`);
+  console.log(`Tasks: ${tasks.length}`);
+
+  if (flags.dryRun) {
+    for (const task of tasks) {
+      console.log(`DRY ${String(task.index).padStart(2, "0")} ratio=${task.ratio} request=${task.requestSize} output=${task.outputPath}`);
+    }
+    return 0;
+  }
+
+  mkdirSync(outputRoot, { recursive: true });
+  const report = await runWorkerTaskQueue(workers, tasks, {
+    concurrency,
+    adaptive: flags.adaptive !== false,
+    maxRetries: MAX_RETRIES,
+    retryDelayMs: RETRY_BACKOFF_MS,
+    outputDir: outputRoot,
+    returnReport: true,
+    onTaskStart: (task, context) => {
+      console.log(`[${context.index + 1}/${context.total}] ${task.startText} via ${workerLabel(context.worker)} [Images API]`);
+    },
+    runTask: async (worker, task) => {
+      const result = await generateImageForWorker(worker, task.prompt, task.requestSize, outputRoot, {
+        resize: false,
+        savePath: task.outputPath,
+        fhlApiMode: FHL_API_MODE_IMAGES,
+      });
+      return {
+        ...result,
+        ratio: task.ratio,
+        requestSize: task.requestSize,
+        classification: classifyRatioStressResult(task, result),
+      };
+    },
+  });
+  const reportPaths = writeFhl4kRatioStressReports(outputRoot, tasks, report, prompts[0]);
+  const exactCount = reportPaths.records.filter((item) => item.classification === "exact_4k_supported").length;
+  const aspectOnlyCount = reportPaths.records.filter((item) => item.classification === "aspect_only_supported").length;
+  const mismatchCount = reportPaths.records.filter((item) => item.classification === "dimension_mismatch").length;
+  const failedCount = reportPaths.records.filter((item) => item.classification === "failed").length;
+
+  console.log(`Summary: exact=${exactCount}, aspect_only=${aspectOnlyCount}, mismatch=${mismatchCount}, failed=${failedCount}`);
+  for (const item of reportPaths.records) {
+    console.log(`${String(item.index).padStart(2, "0")} ${item.ratio} request=${item.requestSize} actual=${item.actualSize || "-"} ${item.classification}${item.path ? ` ${item.path}` : ""}${item.error ? ` error=${item.error}` : ""}`);
+  }
+  console.log(`Manifest: ${reportPaths.manifestPath}`);
+  console.log(`Summary CSV: ${reportPaths.summaryPath}`);
+  console.log(`Failures: ${reportPaths.failuresPath}`);
+  printWorkerStats(report);
+  return failedCount === 0 && mismatchCount === 0 && aspectOnlyCount === 0 ? 0 : 1;
+}
+
 function buildFhlDiagnosticTasks(flags, prompts, size, sources, outputRoot) {
   const suite = String(flags.diagnosticSuite || "fields").trim().toLowerCase();
   const prompt = prompts[0];
@@ -2112,7 +2321,7 @@ async function runFhlMultirefDiagnostic(config, flags, prompts) {
     return 1;
   }
   const requestedAspect = flags.aspect ?? flags.ratio ?? "9:16";
-  const { size } = resolveGenerationParams({ ...flags, aspect: requestedAspect }, { quality: FIXED_REQUEST_QUALITY, ratio: requestedAspect }, { provider, operation: "edit" });
+  const { size } = resolveGenerationParams({ ...flags, aspect: requestedAspect }, { quality: DEFAULT_FHL_REQUEST_QUALITY, ratio: requestedAspect }, { provider, operation: "edit" });
   const outputRoot = flags.outputDir || join(homedir(), "Pictures", "fhl-image-gen", `fhl_multiref_diagnostic_${timestamp()}`);
   const tasks = buildFhlDiagnosticTasks(flags, prompts, size, sourceGroup.sources, outputRoot);
   if (tasks.length === 0) {
@@ -2354,20 +2563,20 @@ async function generateImageForWorker(worker, prompt, size, outputDir, options =
   if (workerProvider(worker) === PROVIDER_APIMART) {
     return generateImageViaApimart(worker.apiKey, prompt, size, outputDir, options);
   }
-  if (normalizeFhlApiMode(options.fhlApiMode) === FHL_API_MODE_IMAGES) {
-    return generateImageViaImages(worker.apiKey, prompt, size, outputDir, options);
+  if (options.allowResponses === true && normalizeFhlApiMode(options.fhlApiMode) === FHL_API_MODE_RESPONSES) {
+    return generateImage(worker.apiKey, prompt, size, outputDir, options);
   }
-  return generateImage(worker.apiKey, prompt, size, outputDir, options);
+  return generateImageViaImages(worker.apiKey, prompt, size, outputDir, options);
 }
 
 async function editImageForWorker(worker, sources, prompt, size, outputDir, options = {}) {
   if (workerProvider(worker) === PROVIDER_APIMART) {
     return editImageViaApimart(worker.apiKey, sources, prompt, size, outputDir, options);
   }
-  if (normalizeFhlApiMode(options.fhlApiMode) === FHL_API_MODE_IMAGES) {
-    return editImageViaImagesOnce(worker.apiKey, sources, prompt, size, outputDir, options);
+  if (options.allowResponses === true && normalizeFhlApiMode(options.fhlApiMode) === FHL_API_MODE_RESPONSES) {
+    return editImageViaResponsesOnce(worker.apiKey, sources, prompt, size, outputDir, options);
   }
-  return editImageViaResponsesOnce(worker.apiKey, sources, prompt, size, outputDir, options);
+  return editImageViaImagesOnce(worker.apiKey, sources, prompt, size, outputDir, options);
 }
 
 function finalizeRoutedTaskResult(result, meta) {
@@ -2387,64 +2596,11 @@ function composeDualRouteError(primaryRoute, primaryError, fallbackRoute, fallba
 }
 
 async function runSingleTaskWithApiMode(apiMode, routes) {
-  const mode = normalizeApiMode(apiMode) || "auto";
-  const executeRoute = async (routeName) => routes[routeName]();
-
-  if (mode === "responses") {
-    const result = await executeRoute("responses");
-    return finalizeRoutedTaskResult(result, {
-      routeUsed: "responses",
-      primaryRoute: "responses",
-      responsesError: result.ok ? null : result.error,
-    });
-  }
-
-  if (mode === "images") {
-    const result = await executeRoute("images");
-    return finalizeRoutedTaskResult(result, {
-      routeUsed: "images",
-      primaryRoute: "images",
-      imagesError: result.ok ? null : result.error,
-    });
-  }
-
-  const primary = await executeRoute("responses");
-  if (primary.ok) {
-    return finalizeRoutedTaskResult(primary, {
-      routeUsed: "responses",
-      primaryRoute: "responses",
-    });
-  }
-
-  if (!isRouteFallbackEligible(primary.error)) {
-    return finalizeRoutedTaskResult(primary, {
-      routeUsed: "responses",
-      primaryRoute: "responses",
-      responsesError: primary.error,
-    });
-  }
-
-  const fallback = await executeRoute("images");
-  if (fallback.ok) {
-    return finalizeRoutedTaskResult(fallback, {
-      routeUsed: "images",
-      primaryRoute: "responses",
-      fallbackRoute: "images",
-      fallbackTriggered: true,
-      responsesError: primary.error,
-    });
-  }
-
-  return finalizeRoutedTaskResult({
-    ...fallback,
-    error: composeDualRouteError("responses", primary.error, "images", fallback.error),
-  }, {
+  const result = await routes.images();
+  return finalizeRoutedTaskResult(result, {
     routeUsed: "images",
-    primaryRoute: "responses",
-    fallbackRoute: "images",
-    fallbackTriggered: true,
-    responsesError: primary.error,
-    imagesError: fallback.error,
+    primaryRoute: "images",
+    imagesError: result.ok ? null : result.error,
   });
 }
 
@@ -2979,7 +3135,7 @@ async function runSingleEdit(workers, imagePath, prompt, size, outputDir, option
 
 async function editImage(workers, imagePaths, prompt, size, outputDir, count = 1, silent = false, options = {}) {
   const resize = options.resize === true;
-  const fhlApiMode = normalizeFhlApiMode(options.fhlApiMode) || FHL_API_MODE_RESPONSES;
+  const fhlApiMode = FHL_API_MODE_IMAGES;
   const paths = Array.isArray(imagePaths) ? imagePaths : [imagePaths];
   const sourceGroup = loadSourceImages(paths);
   if (!sourceGroup.ok) return sourceGroup;
@@ -3054,7 +3210,7 @@ async function runBatch(workers, prompts, size, concurrency, outputDir, options 
     retryDelayMs = RETRY_BACKOFF_MS,
     resize = false,
     returnReport = false,
-    fhlApiMode = FHL_API_MODE_RESPONSES,
+    fhlApiMode = FHL_API_MODE_IMAGES,
   } = options;
 
   const tasks = prompts.map((prompt, index) => ({
@@ -3124,7 +3280,7 @@ async function runBatch(workers, prompts, size, concurrency, outputDir, options 
 
 async function runBatchEdit(workers, imagePaths, prompt, size, concurrency, outputDir, options = {}) {
   const resize = options.resize === true;
-  const fhlApiMode = normalizeFhlApiMode(options.fhlApiMode) || FHL_API_MODE_RESPONSES;
+  const fhlApiMode = FHL_API_MODE_IMAGES;
   const tasks = [];
   for (const imagePath of imagePaths) {
     const sourceGroup = loadSourceImages([imagePath]);
@@ -3666,7 +3822,7 @@ async function runWorkflowQueuePass(workers, queuedTasks, passOptions) {
     resize,
     fixedSources,
     size,
-    fhlApiMode = FHL_API_MODE_RESPONSES,
+    fhlApiMode = FHL_API_MODE_IMAGES,
     liveResults,
     allTasks,
     metadata,
@@ -3765,7 +3921,7 @@ async function runWorkflowBatchEdit(workers, options) {
     preset = null,
     size,
     aspect,
-    fhlApiMode = FHL_API_MODE_RESPONSES,
+    fhlApiMode = FHL_API_MODE_IMAGES,
     concurrency = MAX_CONCURRENCY,
     adaptive = true,
     resize = false,
@@ -3974,7 +4130,7 @@ async function runNailStressTest(workers, options) {
     productDir,
     limit = NAIL_STRESS_DEFAULT_LIMIT,
     size,
-    fhlApiMode = FHL_API_MODE_RESPONSES,
+    fhlApiMode = FHL_API_MODE_IMAGES,
     concurrency = MAX_CONCURRENCY,
     adaptive = true,
     resize = false,
@@ -4400,63 +4556,76 @@ async function runImagesEditSelfTest() {
 }
 
 async function runRouteFallbackSelfTest() {
-  console.log("Route fallback self-test: auto should switch Responses -> Images when eligible.");
+  console.log("Route self-test: FHL public routing should stay on Images API.");
 
+  let responsesCalled = 0;
   let imagesCalled = 0;
-  const autoFallback = await runSingleTaskWithApiMode("auto", {
-    responses: async () => ({ ok: false, error: "HTTP 502: Cloudflare Bad Gateway", elapsed: 10 }),
+  const autoRoute = await runSingleTaskWithApiMode("auto", {
+    responses: async () => {
+      responsesCalled += 1;
+      return { ok: false, error: "Responses should not be called", elapsed: 10 };
+    },
     images: async () => {
       imagesCalled += 1;
       return { ok: true, elapsed: 20, path: "mock.png", fileSize: "0.01MB", width: 1, height: 1, dimensions: "1x1" };
     },
   });
 
-  let authFallbackCalled = false;
-  const authNoFallback = await runSingleTaskWithApiMode("auto", {
-    responses: async () => ({ ok: false, error: "HTTP 401: invalid api key", elapsed: 10 }),
+  let forcedResponsesCalled = 0;
+  let forcedResponsesImagesCalled = 0;
+  const forcedResponses = await runSingleTaskWithApiMode("responses", {
+    responses: async () => {
+      forcedResponsesCalled += 1;
+      return { ok: true, elapsed: 10 };
+    },
     images: async () => {
-      authFallbackCalled = true;
-      return { ok: true, elapsed: 20 };
+      forcedResponsesImagesCalled += 1;
+      return { ok: true, elapsed: 20, path: "mock.png", fileSize: "0.01MB", width: 1, height: 1, dimensions: "1x1" };
     },
   });
 
-  let forcedImagesFallbackCalled = false;
+  let forcedImagesResponsesCalled = 0;
   const forcedImages = await runSingleTaskWithApiMode("images", {
     responses: async () => {
-      forcedImagesFallbackCalled = true;
+      forcedImagesResponsesCalled += 1;
       return { ok: true, elapsed: 10 };
     },
     images: async () => ({ ok: false, error: "HTTP 502: Cloudflare Bad Gateway", elapsed: 20 }),
   });
 
-  const autoFallbackOk = autoFallback.ok
-    && autoFallback.routeUsed === "images"
-    && autoFallback.fallbackTriggered === true
-    && autoFallback.responsesError === "HTTP 502: Cloudflare Bad Gateway"
+  const autoRouteOk = autoRoute.ok
+    && autoRoute.routeUsed === "images"
+    && autoRoute.primaryRoute === "images"
+    && autoRoute.fallbackTriggered === false
+    && responsesCalled === 0
     && imagesCalled === 1;
-  const authNoFallbackOk = !authNoFallback.ok
-    && authNoFallback.routeUsed === "responses"
-    && authNoFallback.fallbackTriggered === false
-    && authFallbackCalled === false;
+  const forcedResponsesOk = forcedResponses.ok
+    && forcedResponses.routeUsed === "images"
+    && forcedResponses.primaryRoute === "images"
+    && forcedResponses.fallbackTriggered === false
+    && forcedResponsesCalled === 0
+    && forcedResponsesImagesCalled === 1;
   const forcedImagesOk = !forcedImages.ok
     && forcedImages.primaryRoute === "images"
     && forcedImages.routeUsed === "images"
-    && forcedImagesFallbackCalled === false;
+    && forcedImagesResponsesCalled === 0;
 
-  if (!autoFallbackOk || !authNoFallbackOk || !forcedImagesOk) {
-    console.error("Route fallback self-test FAILED.");
+  if (!autoRouteOk || !forcedResponsesOk || !forcedImagesOk) {
+    console.error("Route self-test FAILED.");
     console.error(JSON.stringify({
-      autoFallback,
+      autoRoute,
+      responsesCalled,
       imagesCalled,
-      authNoFallback,
-      authFallbackCalled,
+      forcedResponses,
+      forcedResponsesCalled,
+      forcedResponsesImagesCalled,
       forcedImages,
-      forcedImagesFallbackCalled,
+      forcedImagesResponsesCalled,
     }, null, 2));
     return 1;
   }
 
-  console.log("Route fallback self-test OK.");
+  console.log("Route self-test OK.");
   return 0;
 }
 
@@ -4698,6 +4867,7 @@ function parseArgs(argv) {
     else if (value === "--self-test-workflow") args.flags.selfTestWorkflow = true;
     else if (value === "--apimart-roundtrip-test") args.flags.apimartRoundtripTest = true;
     else if (value === "--fhl-multiref-diagnostic") args.flags.fhlMultirefDiagnostic = true;
+    else if (value === "--fhl-4k-ratio-stress-test") args.flags.fhl4kRatioStressTest = true;
     else if (value === "--diagnostic-suite" && argv[i + 1]) args.flags.diagnosticSuite = argv[++i];
     else if (value === "--field-mode" && argv[i + 1]) args.flags.fieldMode = argv[++i];
     else if (value === "--field-modes" && argv[i + 1]) args.flags.fieldModes = argv[++i];
@@ -4738,22 +4908,21 @@ CONFIG
   --remove-worker <worker>
   --enable-worker <worker>
   --disable-worker <worker>
-  --set-fhl-api-mode responses|images     persist the default FHL route
-  --set-quick-mode --ratio R --count 1..${MAX_GENERATION_COUNT}
-  --set-batch-mode --ratio R --concurrency 1..${MAX_CONCURRENCY}
+  --set-quick-mode --quality 2K|4K --ratio R --count 1..${MAX_GENERATION_COUNT}
+  --set-batch-mode --quality 2K|4K --ratio R --concurrency 1..${MAX_CONCURRENCY}
 
 GENERATE
-  --prompt "..." [--ratio R|--aspect R] [--api-mode auto|responses|images] [--fhl-api-mode responses|images] [--count 1..${MAX_GENERATION_COUNT}] [--resize]
+  --prompt "..." [--ratio R|--aspect R] [--quality 2K|4K] [--count 1..${MAX_GENERATION_COUNT}] [--resize]
   --prompt "..." --repeat 1..${MAX_REPEAT} [--concurrency 1..${MAX_CONCURRENCY}] [--adaptive|--no-adaptive]
-  --batch prompts.json [--ratio R|--aspect R] [--concurrency N] [--resize]
-  --batch-inline "prompt 1" "prompt 2" ... [--ratio R|--aspect R] [--concurrency N] [--resize]
+  --batch prompts.json [--ratio R|--aspect R] [--quality 2K|4K] [--concurrency N] [--resize]
+  --batch-inline "prompt 1" "prompt 2" ... [--ratio R|--aspect R] [--quality 2K|4K] [--concurrency N] [--resize]
 
 EDIT
-  --edit --image path.png --prompt "..." [--ratio R|--aspect R] [--api-mode auto|responses|images] [--fhl-api-mode responses|images] [--count 1..${MAX_EDIT_COUNT}] [--concurrency N]
-  --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R] [--count 1..${MAX_EDIT_COUNT}] [--concurrency N]
-  --batch-edit --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R] [--concurrency N]
-  FHL defaults to Images API because the upstream Responses route may be unstable
-  If Images fails, try --api-mode responses for single tasks or --fhl-api-mode responses for provider-level routing
+  --edit --image path.png --prompt "..." [--ratio R|--aspect R] [--quality 2K|4K] [--count 1..${MAX_EDIT_COUNT}] [--concurrency N]
+  --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R] [--quality 2K|4K] [--count 1..${MAX_EDIT_COUNT}] [--concurrency N]
+  --batch-edit --edit --image one.png --image two.png --prompt "..." [--ratio R|--aspect R] [--quality 2K|4K] [--concurrency N]
+  FHL uses Images API for public generation and edit calls
+  If Images fails, the task is retried on Images API; Responses is not exposed in the user flow
   Edit concurrency recommendation: 10-worker edit concurrency is validated for single-reference edits only; keep multi-reference edits low-concurrency
   --legacy-edit and --edit-api images stay disabled as legacy entry points
 
@@ -4770,19 +4939,16 @@ TOOLS
   --resolve-size --quality 2K --aspect 16:9
   --self-test-adaptive
   --self-test-workers
-  --self-test-edit-responses
   --self-test-images-generate
   --self-test-images-edit
-  --self-test-route-fallback
   --self-test-workflow
 
 DEFAULTS
   API root: ${API_ROOT}
-  responses text model: ${TEXT_MODEL}
   image model: ${IMAGE_MODEL}
   default provider: fhl
-  FHL single-task routing: default images; use --api-mode responses or --api-mode auto only when needed
-  request quality: public FHL preset stays fixed ${FIXED_REQUEST_QUALITY}
+  FHL routing: Images API only for public calls
+  request quality: default ${DEFAULT_FHL_REQUEST_QUALITY}; use --quality 4K only when explicitly requested
   saved image policy: always keep the raw upstream PNG; --resize only creates a separate __resized_WxH copy and never overwrites the raw file
   output: ~/Pictures/fhl-image-gen
   worker pool: enabled, max configured workers ${MAX_WORKERS}
@@ -4793,11 +4959,14 @@ DEFAULTS
 
 RATIOS
   FHL 2K generate stable: ${supportedRatioText({ provider: PROVIDER_FHL, operation: "generate", quality: "2K" })}
+  FHL 4K generate available when explicitly requested: ${supportedRatioText({ provider: PROVIDER_FHL, operation: "generate", quality: "4K" })}
   FHL 2K edit stable: ${supportedRatioText({ provider: PROVIDER_FHL, operation: "edit", quality: "2K" })}
+  FHL 4K edit available when explicitly requested: ${supportedRatioText({ provider: PROVIDER_FHL, operation: "edit", quality: "4K" })}
   aliases: square=1:1, landscape=4:3, portrait=3:4
 
 SIZE MATRIX
   2K matrix: 1:1 2048x2048, 3:2 2048x1360, 2:3 1360x2048, 4:3 2048x1536, 3:4 1536x2048, 5:4 2048x1632, 4:5 1632x2048, 16:9 2048x1152, 9:16 1152x2048, 2:1 2048x1024, 1:2 1024x2048, 3:1 2048x688, 1:3 688x2048, 7:4 2208x1264, 4:7 1264x2208
+  4K key matrix: 1:1 2880x2880, 16:9 3840x2160, 9:16 2160x3840
   --size WxH is disabled. Use only --ratio/--aspect from the fixed supported list above.`);
 }
 
@@ -4824,6 +4993,7 @@ INTERNAL BACKUP GENERATE
 INTERNAL DIAGNOSTICS
   --apimart-roundtrip-test [--apimart-resolution 1k|2k|4k]
   --apimart-test-resolution 1k|2k|4k remains as a compatibility alias for diagnostics only
+  --fhl-4k-ratio-stress-test --prompt "..." [--concurrency 1..${MAX_CONCURRENCY}] [--dry-run] [--output-dir dir]
   --fhl-multiref-diagnostic --prompt "..." --image a.png --image b.png [...]
     [--diagnostic-suite fields|upload|concurrency]
     [--field-mode mixed|repeat-image|array]
@@ -4857,7 +5027,7 @@ function resolveGenerationParams(flags, modeConfig, options = {}) {
     if (provider === PROVIDER_APIMART) {
       console.warn(`NOTICE: Internal backup provider uses resolution="${apimartResolution}"; ignoring requested quality="${requestedQuality}". ${APIMART_COST_NOTICE}`);
     } else {
-      console.warn(`NOTICE: FHL Codex image generation is fixed to ${FIXED_REQUEST_QUALITY}; ignoring requested quality="${requestedQuality}". ${FHL_SIZE_LIMIT_NOTICE}`);
+      console.warn(`NOTICE: FHL supports public quality presets 2K and 4K; using ${quality} instead of requested quality="${requestedQuality}". ${FHL_SIZE_LIMIT_NOTICE}`);
     }
   }
 
@@ -4890,7 +5060,7 @@ function didUserExplicitlySetApiMode(flags) {
 }
 
 function explicitNonResponsesApiMode(flags, apiMode) {
-  return didUserExplicitlySetApiMode(flags) && apiMode !== "responses";
+  return false;
 }
 
 function printRouteSummary(result) {
@@ -4913,7 +5083,7 @@ async function main() {
   const requestedApimartResolution = normalizeApimartResolution(flags.apimartResolution) || null;
 
   if (flags.apiMode != null && !apiMode) {
-    console.error(`ERROR: Invalid --api-mode "${flags.apiMode}". Use responses, images, or auto.`);
+    console.error(`ERROR: Invalid --api-mode "${flags.apiMode}". Public FHL routing uses images.`);
     process.exit(1);
   }
   if (flags.provider != null && !requestedProvider) {
@@ -4921,11 +5091,11 @@ async function main() {
     process.exit(1);
   }
   if (flags.fhlApiMode != null && !requestedFhlApiMode) {
-    console.error(`ERROR: Invalid FHL API mode "${flags.fhlApiMode}". Use responses or images.`);
+    console.error(`ERROR: Invalid FHL API mode "${flags.fhlApiMode}". Public FHL routing uses images.`);
     process.exit(1);
   }
   if (flags.setFhlApiMode != null && !requestedSetFhlApiMode) {
-    console.error(`ERROR: Invalid FHL API mode "${flags.setFhlApiMode}". Use responses or images.`);
+    console.error(`ERROR: Invalid FHL API mode "${flags.setFhlApiMode}". Public FHL routing uses images.`);
     process.exit(1);
   }
   if (flags.apimartResolution != null && !normalizeApimartResolution(flags.apimartResolution)) {
@@ -4948,9 +5118,13 @@ async function main() {
   }
 
   if (flags.setFhlApiMode) {
-    config.fhlApiMode = requestedSetFhlApiMode;
+    config.fhlApiMode = FHL_API_MODE_IMAGES;
     saveConfig(config);
-    console.log(`FHL API mode saved: ${requestedSetFhlApiMode}`);
+    if (requestedSetFhlApiMode === FHL_API_MODE_RESPONSES) {
+      console.log("FHL Responses API is currently disabled; saved FHL API mode as images.");
+    } else {
+      console.log("FHL API mode saved: images");
+    }
     return;
   }
 
@@ -5111,7 +5285,7 @@ async function main() {
     const requestedQuality = flags.quality || previous.quality || DEFAULTS.quality;
     const quality = normalizeQuality(requestedQuality);
     if (shouldWarnFixedQuality(requestedQuality)) {
-      console.warn(`NOTICE: Quick mode is fixed to ${FIXED_REQUEST_QUALITY}; ignoring requested quality="${requestedQuality}". ${FHL_SIZE_LIMIT_NOTICE}`);
+      console.warn(`NOTICE: Quick mode supports FHL quality presets 2K and 4K; using ${quality} instead of requested quality="${requestedQuality}". ${FHL_SIZE_LIMIT_NOTICE}`);
     }
     const ratio = normalizeRatio(flags.aspect ?? flags.ratio ?? previous.ratio ?? DEFAULTS.ratio);
     const count = clampInteger(flags.count ?? previous.count, 1, MAX_GENERATION_COUNT, DEFAULTS.count);
@@ -5136,7 +5310,7 @@ async function main() {
     const requestedQuality = flags.quality || previous.quality || DEFAULTS.quality;
     const quality = normalizeQuality(requestedQuality);
     if (shouldWarnFixedQuality(requestedQuality)) {
-      console.warn(`NOTICE: Batch mode is fixed to ${FIXED_REQUEST_QUALITY}; ignoring requested quality="${requestedQuality}". ${FHL_SIZE_LIMIT_NOTICE}`);
+      console.warn(`NOTICE: Batch mode supports FHL quality presets 2K and 4K; using ${quality} instead of requested quality="${requestedQuality}". ${FHL_SIZE_LIMIT_NOTICE}`);
     }
     const ratio = normalizeRatio(flags.aspect ?? flags.ratio ?? previous.ratio ?? DEFAULTS.ratio);
     const concurrency = clampInteger(flags.concurrency ?? previous.concurrency, 1, MAX_CONCURRENCY, DEFAULTS.concurrency);
@@ -5202,6 +5376,11 @@ async function main() {
     return;
   }
 
+  if (flags.fhl4kRatioStressTest) {
+    process.exitCode = await runFhl4kRatioStressTest(config, flags, prompts);
+    return;
+  }
+
   if (flags.help || (prompts.length === 0 && !flags.batchFile && !flags.edit && !flags.nailStressTest && !flags.workflowBatchEdit)) {
     printUsage({ internal: flags.internal === true });
     return;
@@ -5236,7 +5415,7 @@ async function main() {
 
   if (flags.workflowBatchEdit) {
     if (explicitNonResponsesApiMode(flags, apiMode)) {
-      console.error("ERROR: --api-mode only applies to single FHL tasks. For workflow use --fhl-api-mode responses|images.");
+      console.error("ERROR: --api-mode is not exposed for workflow tasks; FHL workflow tasks use Images API.");
       process.exit(1);
     }
     if (!flags.itemDir) {
@@ -5251,7 +5430,7 @@ async function main() {
       process.exit(1);
     }
     const workflowAspect = flags.aspect ?? flags.ratio ?? "9:16";
-    const { ratio, size } = resolveGenerationParams({ ...flags, aspect: workflowAspect }, { quality: FIXED_REQUEST_QUALITY, ratio: workflowAspect }, { provider: providerForRun, operation: "edit", apimartResolution: requestedApimartResolution });
+    const { ratio, size } = resolveGenerationParams({ ...flags, aspect: workflowAspect }, { quality: DEFAULT_FHL_REQUEST_QUALITY, ratio: workflowAspect }, { provider: providerForRun, operation: "edit", apimartResolution: requestedApimartResolution });
     const limitExplicit = flags.limit != null;
     const limit = clampInteger(flags.limit, 1, 1000, WORKFLOW_DEFAULT_LIMIT);
     const concurrency = clampInteger(flags.concurrency ?? MAX_CONCURRENCY, 1, MAX_CONCURRENCY, Math.min(MAX_CONCURRENCY, DEFAULTS.concurrency));
@@ -5280,7 +5459,7 @@ async function main() {
 
   if (flags.nailStressTest) {
     if (explicitNonResponsesApiMode(flags, apiMode)) {
-      console.error("ERROR: --api-mode only applies to single FHL tasks. For nail stress test use --fhl-api-mode responses|images.");
+      console.error("ERROR: --api-mode is not exposed for nail stress test; FHL tasks use Images API.");
       process.exit(1);
     }
     if (!flags.personaPath) {
@@ -5299,7 +5478,7 @@ async function main() {
     }
     const limit = clampInteger(flags.limit, 1, 1000, NAIL_STRESS_DEFAULT_LIMIT);
     const concurrency = clampInteger(flags.concurrency ?? MAX_CONCURRENCY, 1, MAX_CONCURRENCY, Math.min(MAX_CONCURRENCY, DEFAULTS.concurrency));
-    const { size } = resolveGenerationParams({ ...flags, aspect: "9:16" }, { quality: FIXED_REQUEST_QUALITY, ratio: "9:16" }, { provider: providerForRun, operation: "edit", apimartResolution: requestedApimartResolution });
+    const { size } = resolveGenerationParams({ ...flags, aspect: "9:16" }, { quality: DEFAULT_FHL_REQUEST_QUALITY, ratio: "9:16" }, { provider: providerForRun, operation: "edit", apimartResolution: requestedApimartResolution });
     const result = await runNailStressTest(configuredWorkers, {
       personaPath: flags.personaPath,
       productDir: flags.productDir,
@@ -5334,13 +5513,13 @@ async function main() {
       process.exit(1);
     }
     if (flags.unsupportedEditRoute) {
-      console.error("ERROR: --legacy-edit and --edit-api images are legacy-disabled in this plugin. Use --api-mode images for single FHL edit tests or --fhl-api-mode images for provider-level FHL routing.");
+      console.error("ERROR: --legacy-edit and --edit-api are disabled. FHL edit already uses Images API by default.");
       process.exit(1);
     }
     const { size } = resolveGenerationParams(flags, config.quickMode, { provider: providerForRun, operation: "edit", apimartResolution: requestedApimartResolution });
     if (images.length > 1 && flags.batchEdit) {
       if (explicitNonResponsesApiMode(flags, apiMode)) {
-        console.error("ERROR: --api-mode only applies to single FHL tasks. For batch edit use --fhl-api-mode responses|images.");
+        console.error("ERROR: --api-mode is not exposed for batch edit; FHL batch edit uses Images API.");
         process.exit(1);
       }
       const concurrency = clampInteger(flags.concurrency ?? config.batchMode?.concurrency, 1, MAX_CONCURRENCY, DEFAULTS.concurrency);
@@ -5355,7 +5534,7 @@ async function main() {
     const count = clampInteger(flags.count, 1, MAX_EDIT_COUNT, 1);
     const isSingleImagesApiEligible = providerForRun === PROVIDER_FHL && images.length === 1 && count === 1 && !flags.batchEdit && !requestedFhlApiMode;
     if (!isSingleImagesApiEligible && explicitNonResponsesApiMode(flags, apiMode)) {
-      console.error("ERROR: --api-mode currently supports only single-image single-task FHL edit in v0.2.0. Use --fhl-api-mode for provider-level FHL routing.");
+      console.error("ERROR: --api-mode is not exposed for this edit path; FHL edit uses Images API.");
       process.exit(1);
     }
     const concurrency = clampInteger(flags.concurrency ?? config.batchMode?.concurrency ?? count, 1, MAX_CONCURRENCY, DEFAULTS.concurrency);
@@ -5410,7 +5589,7 @@ async function main() {
 
   if (flags.batchFile) {
     if (explicitNonResponsesApiMode(flags, apiMode)) {
-      console.error("ERROR: --api-mode only applies to single FHL tasks. For batch use --fhl-api-mode responses|images.");
+      console.error("ERROR: --api-mode is not exposed for batch tasks; FHL batch tasks use Images API.");
       process.exit(1);
     }
     const raw = readFileSync(flags.batchFile, "utf8");
@@ -5435,7 +5614,7 @@ async function main() {
 
   if (flags.batchInline) {
     if (explicitNonResponsesApiMode(flags, apiMode)) {
-      console.error("ERROR: --api-mode only applies to single FHL tasks. For batch-inline use --fhl-api-mode responses|images.");
+      console.error("ERROR: --api-mode is not exposed for batch-inline tasks; FHL batch-inline tasks use Images API.");
       process.exit(1);
     }
     if (prompts.length > MAX_BATCH_PROMPTS) {

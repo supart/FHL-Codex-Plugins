@@ -1,26 +1,26 @@
 # FHL Codex Plugins
 
-## v0.2.0 发布说明
+## v0.2.1 开发版说明
 
-v0.2.0 默认使用 FHL Images API 主链路，并保留 Responses 作为显式切换路线。
+v0.2.1 默认使用 FHL Images API 主链路。FHL Responses 当前不可用，不作为用户可切换路线；如果 Images API 失败，插件继续按 Images API 重试。
 
 当前规则固定为：
 
-- 单张文生图支持 `--api-mode responses|images|auto`
-- 单图图生图支持 `--api-mode responses|images|auto`
-- 默认单任务行为是 `images`，因为 Responses 上游可能无法稳定返回图片结果
-- `--count > 1`、`--repeat`、`--batch`、`--batch-inline`、`--batch-edit`、`--workflow-batch-edit`、`--nail-stress-test`、多参考图 edit 默认也使用 FHL Images API；需要排查时可显式切换 `--fhl-api-mode responses`
+- 文生图、图生图、批量和 workflow 默认都使用 FHL Images API
+- 不再对用户开放 Responses 切换
+- 失败重试仍发生在 Images API 链路上
+- 默认请求 2K；只有用户明确要求 4K 时才加 `--quality 4K`
 - `--legacy-edit` 和 `--edit-api images` 继续保留为旧入口报错，不作为新链路使用方式
 
 示例：
 
 ```powershell
-node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --prompt "在河边钓鱼的小狗" --aspect 1:1 --api-mode images
-node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --prompt "在河边钓鱼的小狗" --aspect 1:1 --api-mode responses
-node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --edit --image "C:\path\input.png" --prompt "将这张图改成 9:16 竖版海报" --aspect 9:16 --api-mode images
+node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --prompt "在河边钓鱼的小狗" --aspect 1:1
+node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --prompt "河边钓鱼的大熊猫" --aspect 9:16 --quality 4K
+node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --edit --image "C:\path\input.png" --prompt "将这张图改成 9:16 竖版海报" --aspect 9:16
 ```
 
-如果 Images API 跑不通，可以尝试显式切回 Responses 路线。
+如果 Images API 跑不通，先重试或降低并发，不再切回 Responses。
 
 给 Codex 用的 FHL 插件 marketplace。
 
@@ -45,7 +45,7 @@ codex plugin add fhl-image-gen@fhl-plugins
 - marketplace 展示名：`FHL Plugins`
 - 当前插件：`fhl-image-gen@fhl-plugins`
 
-`fhl-image-gen` 是一个基于 FHL Images API 默认链路、并保留 Responses 显式切换路线的 Codex 生图插件，支持：
+`fhl-image-gen` 是一个基于 FHL Images API 默认链路的 Codex 生图插件，支持：
 
 - 文生图
 - 单图图生图
@@ -282,7 +282,7 @@ node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --workflow-batch-edit --
 
 ## 支持的比例与尺寸
 
-插件当前固定为 2K 请求矩阵，只允许使用已验证可用的比例。
+插件默认使用 2K 请求矩阵；用户明确要求 4K 时，可使用 `--quality 4K` 请求 4K 矩阵。仍不支持任意 `--size` 自定义。
 
 支持比例：
 
@@ -320,6 +320,14 @@ node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --workflow-batch-edit --
 | `7:4` | `2208x1264` |
 | `4:7` | `1264x2208` |
 
+4K 常用尺寸：
+
+| 比例 | 尺寸 |
+| --- | --- |
+| `1:1` | `2880x2880` |
+| `16:9` | `3840x2160` |
+| `9:16` | `2160x3840` |
+
 已禁用比例：
 
 - `5:4`
@@ -335,14 +343,13 @@ node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --workflow-batch-edit --
 
 - 文生图默认走 `POST https://www.fhl.mom/v1/images/generations`
 - 图生图默认走 `POST https://www.fhl.mom/v1/images/edits`
-- Responses 路线仍保留为显式切换能力：`--api-mode responses` 或 `--fhl-api-mode responses`
-- 文本模型固定为 `gpt-5.5`
+- Responses 代码仅保留为内部诊断参考，不作为用户可切换路线
 - 图像工具模型固定为 `gpt-image-2`
-- 默认图生图使用 FHL Images API 的图片上传方式；Responses 路线才使用 `input_text + input_image`
+- 默认图生图使用 FHL Images API 的图片上传方式
 - 多参考图图生图是多图上传，不是拼图
 - 10 worker 图生图并发目前只建议用于单参考图；多参考图图生图生产建议 `1..5` 张参考图并低并发运行，`6..10` 张只作为重任务/实验范围保留
 - 不支持任意 `--size` 自定义
-- 当前插件固定按 2K 比例矩阵请求
+- 默认按 2K 比例矩阵请求；用户明确要求 4K 时按 4K 比例矩阵请求
 - legacy edit 入口仍保持禁用；默认图生图走当前 FHL Images API 链路
 
 插件内保留如下说明，便于理解当前上游限制：
@@ -412,7 +419,7 @@ node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --get-config
 - 图片路径存在且可读取
 - 图片格式正常
 - 你使用的是 `--edit`
-- 你没有尝试显式切换另一条 FHL 路线，例如 `--api-mode responses` 或 `--fhl-api-mode responses`
+- 没有使用旧版 Responses 路由参数；当前 FHL 图生图只按 Images API 路线运行
 
 ## 仓库与插件信息
 

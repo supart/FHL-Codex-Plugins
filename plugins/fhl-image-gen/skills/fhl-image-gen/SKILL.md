@@ -1,19 +1,19 @@
 ---
 name: "fhl-image-gen"
-description: "Generate or edit images using the FHL Image Gen plugin. Trigger when the user wants AI images through FHL Responses API or FHL Images API, plus multi-worker image generation, batch image generation, continuous image generation, images saved to disk, or edits to existing images."
+description: "Generate or edit images using the FHL Image Gen plugin. Trigger when the user wants AI images through FHL Images API, plus multi-worker image generation, batch image generation, continuous image generation, images saved to disk, or edits to existing images."
 ---
 
 # FHL Image Gen
 
 Use this skill to generate or edit raster images through FHL. For ordinary user setup and usage, present FHL as the only supported provider.
 
-Current `v0.2.0` routing rule:
+Current `v0.2.1` routing rule:
 
-- Single text-to-image supports `--api-mode responses|images|auto`
-- Single-image single-task edit supports `--api-mode responses|images|auto`
-- Default single-task behavior is `images`, because the upstream Responses route may fail to return image results
-- FHL provider-level routing also supports `--fhl-api-mode responses|images`
-- If Images API fails, remind the user they can try `--api-mode responses` for single tasks or `--fhl-api-mode responses` for provider-level runs
+- FHL public generation and edit routes use Images API
+- Do not switch FHL tasks to Responses
+- Do not suggest `--api-mode responses`, `--api-mode auto`, or `--fhl-api-mode responses`
+- If Images API fails, retry Images API, lower concurrency, or rerun later
+- Responses code can remain in the script for internal diagnostics, but it is not user-facing behavior
 - `--legacy-edit` and `--edit-api images` remain invalid legacy entry points
 
 ## Script
@@ -57,7 +57,7 @@ Do not exceed 10 workers in this plugin.
 
 This plugin now supports one plugin with many independent API workers.
 
-- Each worker is one API key with the same FHL base URL and model settings; the current public FHL preset stays on the tested 2K matrix
+- Each worker is one API key with the same FHL base URL and model settings; FHL defaults to the tested 2K matrix and uses 4K only when the user explicitly asks for 4K
 - The worker pool is capped at 10 API workers
 - Single tasks use one worker only
 - Multiple independent tasks run in parallel across multiple workers
@@ -99,21 +99,9 @@ For clear text-to-image requests, do not ask for confirmation:
 node "$HOME/plugins/fhl-image-gen/scripts/generate.mjs" --prompt "<PROMPT>"
 ```
 
-The default single-task route is Images API. To force a specific single-task route:
+The default FHL route is Images API. Do not add route-switching flags for normal user requests.
 
-```bash
-node "$HOME/plugins/fhl-image-gen/scripts/generate.mjs" --prompt "<PROMPT>" --api-mode images
-node "$HOME/plugins/fhl-image-gen/scripts/generate.mjs" --prompt "<PROMPT>" --api-mode responses
-node "$HOME/plugins/fhl-image-gen/scripts/generate.mjs" --prompt "<PROMPT>" --api-mode auto
-```
-
-For non-single-task FHL runs, prefer the provider-level route switch instead of `--api-mode`:
-
-```bash
-node "$HOME/plugins/fhl-image-gen/scripts/generate.mjs" --provider fhl --fhl-api-mode images --batch-inline "<PROMPT_1>" "<PROMPT_2>"
-```
-
-Generation requests still use the public fixed 2K preset in this plugin. Do not use arbitrary `--size`.
+Generation requests default to the public 2K preset. If and only if the user explicitly asks for 4K, add `--quality 4K`. Do not use arbitrary `--size`.
 
 Pass only `--ratio` or `--aspect` when the user asks for a shape. Do not use `--size` for normal generation or edit requests.
 
@@ -121,14 +109,22 @@ Pass only `--ratio` or `--aspect` when the user asks for a shape. Do not use `--
 node "$HOME/plugins/fhl-image-gen/scripts/generate.mjs" --prompt "<PROMPT>" --aspect 16:9
 ```
 
+For explicit 4K requests:
+
+```bash
+node "$HOME/plugins/fhl-image-gen/scripts/generate.mjs" --prompt "<PROMPT>" --aspect 9:16 --quality 4K
+```
+
 Use the tested aspect matrix instead of guessing:
 
 - FHL 2K text-to-image stable: `1:1`, `3:2`, `2:3`, `4:3`, `3:4`, `16:9`, `9:16`, `2:1`, `1:2`, `7:4`, `4:7`
 - FHL 2K edit stable: `1:1`, `3:2`, `2:3`, `4:3`, `3:4`, `5:4`, `4:5`, `16:9`, `9:16`, `2:1`, `1:2`, `3:1`, `1:3`, `7:4`, `4:7`
+- FHL 4K request examples: `1:1=2880x2880`, `16:9=3840x2160`, `9:16=2160x3840`
 - Recorded real tests for future expansion:
   - `1K` generate/edit: all 15 ratios above are stable
   - `4K` generate/edit stable: `1:1`, `3:2`, `2:3`, `16:9`, `9:16`, `2:1`, `1:2`, `3:1`, `1:3`, `7:4`, `4:7`
   - Latest `4K` failures: `4:3`, `3:4`, `5:4`, `4:5`
+  - `2026-07-14` FHL Images 4K text-to-image 10-worker stress test: the 11 stable ratios above returned exact requested dimensions; the 4 failure ratios returned `502` after retries
 
 Aliases are `square=1:1`, `landscape=4:3`, and `portrait=3:4`.
 
@@ -211,27 +207,10 @@ node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --workflow-batch-edit --
 
 ## Edit Existing Images
 
-The image-to-image chain is fixed in this plugin:
-
-- Endpoint: `POST https://www.fhl.mom/v1/responses`
-- Text model: `gpt-5.5`
-- Image tool: `gpt-image-2`
-- Tool action: `edit`
-- Input method: first one `input_text`, then one `input_image` block per source image, in order
-- Output policy: `output_format:"png"`, `moderation:"low"`, `partial_images:0`, `stream:true`
-- This is not a collage step and not legacy multipart edit
-
-Default single-image edits use Images API. If Images fails, try Responses explicitly:
+The image-to-image chain uses FHL Images API. If Images fails, retry Images API, lower concurrency, or rerun later. Do not switch to Responses for user tasks:
 
 ```bash
 node "$HOME/plugins/fhl-image-gen/scripts/generate.mjs" --edit --image "<IMAGE_PATH>" --prompt "<EDIT_INSTRUCTION>" --aspect 9:16
-```
-
-You can also force one route explicitly for single-image single-task edit:
-
-```bash
-node "$HOME/plugins/fhl-image-gen/scripts/generate.mjs" --edit --image "<IMAGE_PATH>" --prompt "<EDIT_INSTRUCTION>" --aspect 9:16 --api-mode images
-node "$HOME/plugins/fhl-image-gen/scripts/generate.mjs" --edit --image "<IMAGE_PATH>" --prompt "<EDIT_INSTRUCTION>" --aspect 9:16 --api-mode responses
 ```
 
 For multiple edit variations of one source, each variation is a separate FHL edit request and may be scheduled to different workers:
@@ -240,7 +219,7 @@ For multiple edit variations of one source, each variation is a separate FHL edi
 node "$HOME/plugins/fhl-image-gen/scripts/generate.mjs" --edit --image "<IMAGE_PATH>" --prompt "<EDIT_INSTRUCTION>" --count 3 --concurrency 3
 ```
 
-For multi-reference image-to-image, pass multiple `--image` flags. The plugin follows the desktop FHL behavior: each source image is sent in the same order as the CLI arguments. The default route is Images API; use `--fhl-api-mode responses` only when explicitly testing the Responses route:
+For multi-reference image-to-image, pass multiple `--image` flags. The plugin follows the desktop FHL behavior: each source image is sent in the same order as the CLI arguments. The route remains Images API:
 
 ```bash
 node "$HOME/plugins/fhl-image-gen/scripts/generate.mjs" --edit --image "<PATH_1>" --image "<PATH_2>" --prompt "<EDIT_INSTRUCTION>" --aspect 9:16
@@ -254,7 +233,7 @@ To force per-source batch behavior instead of one combined multi-reference reque
 node "$HOME/plugins/fhl-image-gen/scripts/generate.mjs" --batch-edit --edit --image "<PATH_1>" --image "<PATH_2>" --prompt "<EDIT_INSTRUCTION>" --concurrency 3
 ```
 
-Do not use `--legacy-edit` or `--edit-api images` here. They stay disabled as legacy entry points. Use `--api-mode images` for the new Images API test route.
+Do not use `--legacy-edit`, `--edit-api images`, or Responses route flags here. FHL edit already uses Images API.
 
 ## Nail Try-On Preset / Legacy Stress Test
 
@@ -307,17 +286,12 @@ node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --nail-stress-test --per
 
 - Text-to-image default: `POST https://www.fhl.mom/v1/images/generations`
 - Image edit default: `POST https://www.fhl.mom/v1/images/edits`
-- Responses route remains available as an explicit fallback with `--api-mode responses` or `--fhl-api-mode responses`
-- Responses text model: `gpt-5.5`
 - Image generation tool model: `gpt-image-2`
-- Request size policy: always use the fixed 2K public preset matrix and the tested aspect list above; do not request arbitrary `--size`
+- Request size policy: default to the 2K public preset matrix; use `--quality 4K` only for explicit 4K user requests; do not request arbitrary `--size`
 - Internal backup size policy: default `1k` for cost control; treat higher backup resolutions as explicit internal-only behavior
 - Saved-file policy: keep the raw upstream PNG as the primary output file; any resize must be a separate derived copy, never an in-place overwrite
 - Auth: `Authorization: Bearer <FHL API Key>`
-- Responses body: JSON with `model`, `input`, `tools`, `tool_choice`, `reasoning`, `store:false`, and `stream:true`
-- Edit Responses input: `input_text` plus one `input_image` data URL per source image, in order
-- Edit Responses tool: `type:"image_generation"`, `action:"edit"`, `output_format:"png"`, `moderation:"low"`, `partial_images:0`
-- Responses result parsing: final image comes from SSE event `response.output_item.done` where `item.type` is `image_generation_call` and `item.result` is base64 image data
+- Responses code is retained only for internal diagnostics and is not a user-facing FHL route
 - Worker routing rule: single task = single worker; multiple independent tasks = many workers when available
 - Workflow batch edit: generic fixed refs + variable item ref + user templates. Do not assume product type.
 - Workflow reliability: resume existing PNG outputs, auto repair missing outputs, and write `manifest.json`, `summary.csv`, `failures.json`, and `sessions.json`.
@@ -332,8 +306,8 @@ node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --help
 node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --get-config
 node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --list-workers
 node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --resolve-size --aspect 9:16
+node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --resolve-size --quality 4K --aspect 9:16
 node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --self-test-adaptive
-node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --self-test-edit-responses
 node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --self-test-workflow
 node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --workflow-batch-edit --fixed-ref "<人物参考图.png>" --item-dir "<产品图目录>" --preset nail-tryon --limit 10 --concurrency 10 --aspect 9:16 --dry-run
 node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --nail-stress-test --persona "<人物参考图.png>" --product-dir "<产品图目录>" --limit 100 --concurrency 10 --dry-run
@@ -345,7 +319,7 @@ When real generation or edit requests succeed, always show the successful saved 
 
 - Quick same-prompt generation: 1 to 9 images
 - Continuous generation: `--repeat 1..50`
-- Request quality: public preset fixed 2K
+- Request quality: default 2K; explicit 4K user requests use `--quality 4K`
 - Default saved output: raw upstream PNG
 - Edit variations: 1 to 4 images
 - Batch prompts: up to 20

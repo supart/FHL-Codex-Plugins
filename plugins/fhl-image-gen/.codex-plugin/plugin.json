@@ -1,15 +1,15 @@
 {
   "name": "fhl-image-gen",
-  "version": "0.2.0",
-  "description": "在 Codex 中通过 FHL Responses API 与 Images API 生成和编辑图像，支持最多 10 个独立 worker。v0.2.0 新增单任务双路自动切换。",
+  "version": "0.2.1",
+  "description": "在 Codex 中通过 FHL Images API 生成和编辑图像，支持最多 10 个独立 worker。v0.2.1 默认 2K，用户明确要求时可请求 4K。",
   "author": {
     "name": "FHL Local"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "FHL Image Gen",
-    "shortDescription": "使用 FHL 进行文生图、图生图与批量工作流；v0.2.0 单任务支持 Responses / Images / Auto。",
-    "longDescription": "一个面向 Codex 的本地 FHL 生图插件。保持固定 2K 比例矩阵、多 worker 调度、workflow-batch-edit 与 nail-tryon 预设不变；v0.2.0 将 FHL 单任务默认路由调整为 Images API，并保留 Responses 作为显式切换入口，方便在上游波动时手动排查。",
+    "shortDescription": "使用 FHL Images API 进行文生图、图生图与批量工作流；默认 2K，明确要求时请求 4K。",
+    "longDescription": "一个面向 Codex 的本地 FHL 生图插件。v0.2.1 开发版以 v0.2.0 发布版为基线，保持多 worker 调度、workflow-batch-edit、nail-tryon 预设和默认 Images API 链路；FHL 默认请求 2K，用户明确要求 4K 时使用 4K 尺寸矩阵，Responses 仅保留为内部诊断代码，不作为用户可切换路线。",
     "developerName": "FHL Local",
     "category": "Productivity",
     "capabilities": ["Write"],
