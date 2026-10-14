@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, parse } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const API_ROOT = "https://www.fhl.mom";
 const RESPONSES_URL = `${API_ROOT}/v1/responses`;
@@ -18,6 +19,8 @@ const APIMART_MODEL = "gpt-image-2";
 const APIMART_RESOLUTION = "1k";
 const APIMART_COST_NOTICE = "APIMart defaults to 1k because real backend billing changes with 1k/2k/4k size tiers.";
 const CONFIG_PATH = join(homedir(), ".codex", "fhl-image-gen-config.json");
+const GREEN_PROCESSOR_PATH = join(dirname(fileURLToPath(import.meta.url)), "green_screen_processor.py");
+const GREEN_SCREEN_PROMPT_SUFFIX = "Generate the requested subject on a perfectly uniform chroma key green background. Use a solid green background approximately RGB 0,255,0 outside the subject. Keep the subject fully separated from the background with a clean continuous outline. Do not add shadows, gradients, texture, fog, particles, floor, props, text, watermark, border, or background decoration outside the subject. Preserve the requested white sticker outline if specified. The green background must remain connected to all image edges. Do not use green as a subject color unless it is explicitly part of the requested subject. The output must be PNG.";
 const NO_PROMPT_REVISION_INSTRUCTIONS = "You are a tool runner. Pass the user prompt to image_generation VERBATIM. DO NOT rewrite, expand, polish, or revise it in any way. Use the exact text the user gave.";
 
 const MAX_GENERATION_COUNT = 9;
@@ -602,6 +605,163 @@ function resolveOutputDir(userDir) {
   const dir = userDir || join(homedir(), "Pictures", "fhl-image-gen");
   mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+function greenProcessorPythonCandidates() {
+  const bundledRoot = join(homedir(), ".cache", "codex-runtimes", "codex-primary-runtime", "dependencies", "python");
+  return [
+    process.env.FHL_PYTHON,
+    process.env.CODEX_PYTHON,
+    join(bundledRoot, process.platform === "win32" ? "python.exe" : "bin/python"),
+    process.platform === "win32" ? "python.exe" : "python3",
+    "python3",
+  ].filter(Boolean);
+}
+
+function runGreenProcessor(command, args, options = {}) {
+  const pythonCandidates = greenProcessorPythonCandidates();
+  let lastError = "Python runtime not found";
+  for (const python of pythonCandidates) {
+    const probe = spawnSync(python, ["-c", "import PIL, numpy"], { encoding: "utf8", windowsHide: true });
+    if (probe.error || probe.status !== 0) {
+      lastError = probe.stderr?.trim() || probe.error?.message || lastError;
+      continue;
+    }
+    const result = spawnSync(python, [GREEN_PROCESSOR_PATH, command, ...args], { encoding: "utf8", windowsHide: true, maxBuffer: 16 * 1024 * 1024 });
+    if (result.error || result.status !== 0) {
+      lastError = result.stderr?.trim() || result.stdout?.trim() || result.error?.message || `processor exited ${result.status}`;
+    } else {
+      const lines = String(result.stdout || "").trim().split(/\r?\n/).filter(Boolean);
+      try { return { ok: true, ...JSON.parse(lines.at(-1) || "{}")} } catch { return { ok: false, error: "Green processor returned invalid JSON", raw: result.stdout }; }
+    }
+  }
+  return { ok: false, error: lastError };
+}
+
+function greenPrompt(prompt) {
+  return `${prompt}\n\n${GREEN_SCREEN_PROMPT_SUFFIX}`;
+}
+
+function copyGeneratedToRaw(sourcePath, outputRoot) {
+  const rawPath = join(outputRoot, "raw_green", "source.png");
+  mkdirSync(dirname(rawPath), { recursive: true });
+  copyFileSync(sourcePath, rawPath);
+  return rawPath;
+}
+
+function printGreenSummary(result, outputRoot) {
+  outputRoot = resolveOutputDir(outputRoot);
+  const items = result?.items || [];
+  const counts = { passed: 0, uncertain: 0, failed: 0 };
+  for (const item of items) counts[item.status] = (counts[item.status] || 0) + 1;
+  console.log(`Green-screen output: ${outputRoot}`);
+  console.log(`Summary: ${counts.passed || 0} passed, ${counts.uncertain || 0} uncertain, ${counts.failed || 0} failed`);
+  const rawSource = join(outputRoot, "raw_green", "source.png");
+  if (existsSync(rawSource)) console.log(`Raw green path: ${rawSource}`);
+  for (const item of items.filter((entry) => entry.output_path || entry.transparent_path || entry.master_path).slice(0, 8)) {
+    console.log(`Path: ${item.output_path || item.transparent_path || item.master_path}`);
+  }
+}
+
+function processorArgs(flags, command) {
+  const args = [];
+  const values = [
+    ["--green-threshold", flags.greenThreshold],
+    ["--spill-threshold", flags.spillThreshold],
+    ["--edge-feather", flags.edgeFeather],
+    ["--background-color", flags.backgroundColor],
+  ];
+  for (const [name, value] of values) if (value != null) args.push(name, String(value));
+  return args;
+}
+
+function runRemoveGreen(flags) {
+  const image = flags.images?.[0];
+  if (!image) return { ok: false, error: "--remove-green requires --image <path>." };
+  if (!flags.outputDir) return { ok: false, error: "--remove-green requires --output-dir <dir>." };
+  if (flags.dryRun) {
+    console.log(`Dry run: remove green from ${image}`);
+    console.log(`Output: ${resolveOutputDir(flags.outputDir)}`);
+    return { ok: true, dryRun: true };
+  }
+  return runGreenProcessor("remove-green", [...processorArgs(flags, ""), "--input", image, "--output-dir", flags.outputDir, "--name", "result"].filter(Boolean));
+}
+
+function runSplitGreenGrid(flags) {
+  const image = flags.images?.[0];
+  if (!image) return { ok: false, error: "--split-green-grid requires --image <path>." };
+  if (!flags.outputDir) return { ok: false, error: "--split-green-grid requires --output-dir <dir>." };
+  if (!Number.isInteger(flags.columns) || !Number.isInteger(flags.rows) || flags.columns < 1 || flags.rows < 1) return { ok: false, error: "--split-green-grid requires positive --columns and --rows." };
+  if (flags.dryRun) {
+    console.log(`Dry run: split ${image} into ${flags.columns}x${flags.rows} cells`);
+    console.log(`Output: ${resolveOutputDir(flags.outputDir)}`);
+    return { ok: true, dryRun: true };
+  }
+  const args = [...processorArgs(flags, ""), "--input", image, "--output-dir", flags.outputDir, "--columns", String(flags.columns), "--rows", String(flags.rows)];
+  if (flags.captions != null) args.push("--captions", flags.captions);
+  return runGreenProcessor("split-grid", args.filter(Boolean));
+}
+
+async function runGreenScreenGenerate(workers, prompt, size, outputRoot, options = {}) {
+  const root = resolveOutputDir(outputRoot);
+  const fullPrompt = greenPrompt(prompt);
+  if (options.dryRun) {
+    console.log(`Dry run: green-screen generation for "${truncateText(prompt)}"`);
+    console.log(`Output: ${root}`);
+    return { ok: true, dryRun: true, outputRoot: root };
+  }
+  const rawDir = join(root, "raw_green");
+  const generated = await runSingleGenerate(workers, fullPrompt, size, rawDir, {
+    adaptive: options.adaptive !== false,
+    resize: false,
+    fhlApiMode: options.fhlApiMode || null,
+    apimartResolution: options.apimartResolution,
+    apiMode: "images",
+  });
+  if (!generated.ok) return generated;
+  const rawPath = copyGeneratedToRaw(generated.path, root);
+  const processed = runGreenProcessor("remove-green", [...processorArgs(options, ""), "--input", rawPath, "--output-dir", root, "--name", "result"].filter(Boolean));
+  if (!processed.ok) return { ok: false, error: processed.error, generated, processor: processed, outputRoot: root };
+  saveTextArtifact(join(root, "reports", "prompt.txt"), fullPrompt);
+  return { ok: true, outputRoot: root, generated, processor: processed, items: processed.items || [] };
+}
+
+async function runGreenScreenBatch(workers, tasks, size, outputRoot, options = {}) {
+  const root = resolveOutputDir(outputRoot);
+  const prompts = tasks.map((task) => greenPrompt(String(task.prompt)));
+  if (options.dryRun) {
+    console.log(`Dry run: ${tasks.length} green-screen tasks`);
+    console.log(`Output: ${root}`);
+    return { ok: true, dryRun: true, outputRoot: root, items: [] };
+  }
+  const rawDir = join(root, "raw_green");
+  const generated = await runBatch(workers, prompts, size, options.concurrency || DEFAULTS.concurrency, rawDir, {
+    adaptive: options.adaptive !== false,
+    fhlApiMode: options.fhlApiMode || null,
+    apimartResolution: options.apimartResolution,
+    resize: false,
+    returnReport: true,
+  });
+  const records = [];
+  for (const [index, task] of tasks.entries()) {
+    const result = generated?.results?.[index];
+    const itemRoot = join(root, "items", sanitizePathSegment(task.id || `task_${index + 1}`));
+    if (!result?.ok || !result.path) {
+      records.push({ id: task.id || null, status: "failed", error: result?.error || "generation failed" });
+      continue;
+    }
+    const rawPath = copyGeneratedToRaw(result.path, itemRoot);
+    const processed = runGreenProcessor("remove-green", [...processorArgs(options, ""), "--input", rawPath, "--output-dir", itemRoot, "--name", "result"].filter(Boolean));
+    const item = processed.items?.[0] || { status: processed.ok ? "passed" : "failed", error: processed.error };
+    records.push({ id: task.id || null, prompt: task.prompt, ...item });
+  }
+  saveTextArtifact(join(root, "reports", "prompt.txt"), prompts.join("\n\n"));
+  const reportRoot = join(root, "reports");
+  mkdirSync(reportRoot, { recursive: true });
+  saveTextArtifact(join(reportRoot, "manifest.json"), JSON.stringify({ processor_version: "0.2.2", created_at: new Date().toISOString(), items: records }, null, 2));
+  saveTextArtifact(join(reportRoot, "quality_report.json"), JSON.stringify({ processor_version: "0.2.2", items: records }, null, 2));
+  saveTextArtifact(join(reportRoot, "retry_report.json"), JSON.stringify({ processor_version: "0.2.2", items: records.filter((item) => item.status === "failed") }, null, 2));
+  return { ok: records.every((item) => item.status !== "failed"), outputRoot: root, items: records, generated };
 }
 
 function fileStem(name) {
@@ -1309,7 +1469,7 @@ function buildImagesEditFormWithFieldMode(prompt, size, sources, fieldMode = "mi
 }
 
 function buildImagesEditForm(prompt, size, sources) {
-  return buildImagesEditFormWithFieldMode(prompt, size, sources, "mixed");
+  return buildImagesEditFormWithFieldMode(prompt, size, sources, "repeat-image");
 }
 
 function extractImagesFromImagesApiResponse(data) {
@@ -4514,10 +4674,9 @@ async function runImagesEditSelfTest() {
   ];
   const form = buildImagesEditForm("mock edit prompt", "1152x2048", sources);
   const formKeys = Array.from(form.keys());
-  const imagePrimary = form.get("image");
-  const imageSecondary = form.getAll("image[]");
-  const payloadOk = formKeys.includes("image")
-    && formKeys.includes("image[]")
+  const images = form.getAll("image");
+  const payloadOk = formKeys.filter((key) => key === "image").length === 2
+    && !formKeys.includes("image[]")
     && form.get("prompt")?.toString().includes("mock edit prompt")
     && form.get("model") === IMAGE_MODEL
     && form.get("n") === "1"
@@ -4525,8 +4684,7 @@ async function runImagesEditSelfTest() {
     && form.get("quality") === "auto"
     && form.get("output_format") === "png"
     && form.get("response_format") === "b64_json"
-    && imagePrimary
-    && imageSecondary.length === 1;
+    && images.length === 2;
 
   const pngB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
   const extracted = extractImagesFromImagesApiResponse({
@@ -4542,7 +4700,7 @@ async function runImagesEditSelfTest() {
     console.error(JSON.stringify({
       payloadOk,
       formKeys,
-      imageSecondaryCount: imageSecondary.length,
+      imageCount: images.length,
       extracted,
       savedOk,
       saved,
@@ -4788,6 +4946,7 @@ function parseArgs(argv) {
   while (i < argv.length) {
     const value = argv[i];
     if (value === "--get-config") args.flags.getConfig = true;
+    else if (value === "--doctor") args.flags.doctor = true;
     else if (value === "--list-workers") args.flags.listWorkers = true;
     else if (value === "--provider" && argv[i + 1]) args.flags.provider = argv[++i];
     else if (value === "--fhl-api-mode" && argv[i + 1]) args.flags.fhlApiMode = argv[++i];
@@ -4815,6 +4974,17 @@ function parseArgs(argv) {
     else if (value === "--repeat" && argv[i + 1]) args.flags.repeat = Number.parseInt(argv[++i], 10);
     else if (value === "--limit" && argv[i + 1]) args.flags.limit = Number.parseInt(argv[++i], 10);
     else if (value === "--output-dir" && argv[i + 1]) args.flags.outputDir = argv[++i];
+    else if (value === "--remove-green") args.flags.removeGreen = true;
+    else if (value === "--green-screen") args.flags.greenScreen = true;
+    else if (value === "--split-green-grid") args.flags.splitGreenGrid = true;
+    else if (value === "--green-screen-batch") args.flags.greenScreenBatch = true;
+    else if (value === "--columns" && argv[i + 1]) args.flags.columns = Number.parseInt(argv[++i], 10);
+    else if (value === "--rows" && argv[i + 1]) args.flags.rows = Number.parseInt(argv[++i], 10);
+    else if (value === "--captions" && argv[i + 1]) args.flags.captions = argv[++i];
+    else if (value === "--green-threshold" && argv[i + 1]) args.flags.greenThreshold = Number.parseFloat(argv[++i]);
+    else if (value === "--spill-threshold" && argv[i + 1]) args.flags.spillThreshold = Number.parseFloat(argv[++i]);
+    else if (value === "--edge-feather" && argv[i + 1]) args.flags.edgeFeather = Number.parseInt(argv[++i], 10);
+    else if (value === "--background-color" && argv[i + 1]) args.flags.backgroundColor = argv[++i];
     else if (value === "--api-mode" && argv[i + 1]) args.flags.apiMode = argv[++i];
     else if (value === "--concurrency" && argv[i + 1]) args.flags.concurrency = Number.parseInt(argv[++i], 10);
     else if (value === "--adaptive") args.flags.adaptive = true;
@@ -4916,6 +5086,14 @@ GENERATE
   --prompt "..." --repeat 1..${MAX_REPEAT} [--concurrency 1..${MAX_CONCURRENCY}] [--adaptive|--no-adaptive]
   --batch prompts.json [--ratio R|--aspect R] [--quality 2K|4K] [--concurrency N] [--resize]
   --batch-inline "prompt 1" "prompt 2" ... [--ratio R|--aspect R] [--quality 2K|4K] [--concurrency N] [--resize]
+
+GREEN SCREEN
+  --doctor
+  --remove-green --image path.png --output-dir dir
+  --green-screen --prompt "..." [--ratio R|--aspect R] [--quality 2K|4K] [--output-dir dir]
+  --split-green-grid --image path.png --columns N --rows N --output-dir dir [--captions "a,b,..."]
+  --green-screen-batch --batch tasks.json [--output-dir dir] [--concurrency N]
+  green options: --green-threshold N --spill-threshold N --edge-feather N --background-color R,G,B
 
 EDIT
   --edit --image path.png --prompt "..." [--ratio R|--aspect R] [--quality 2K|4K] [--count 1..${MAX_EDIT_COUNT}] [--concurrency N]
@@ -5076,6 +5254,12 @@ function printRouteSummary(result) {
 async function main() {
   const { prompts, flags } = parseArgs(process.argv.slice(2));
   const config = loadConfig();
+  if (flags.doctor) {
+    const doctor = runGreenProcessor("doctor", []);
+    console.log(JSON.stringify({ ok: doctor.ok, node: process.execPath, processor: doctor }, null, 2));
+    process.exitCode = doctor.ok ? 0 : 1;
+    return;
+  }
   const apiMode = flags.apiMode == null ? null : normalizeApiMode(flags.apiMode);
   const requestedProvider = flags.provider != null ? normalizeProvider(flags.provider) : null;
   const requestedFhlApiMode = flags.fhlApiMode != null ? normalizeFhlApiMode(flags.fhlApiMode) : null;
@@ -5381,7 +5565,29 @@ async function main() {
     return;
   }
 
-  if (flags.help || (prompts.length === 0 && !flags.batchFile && !flags.edit && !flags.nailStressTest && !flags.workflowBatchEdit)) {
+  if (flags.removeGreen) {
+    const result = runRemoveGreen(flags);
+    if (!result.ok) {
+      console.error(`ERROR: ${result.error}`);
+      process.exitCode = 1;
+    } else if (!result.dryRun) {
+      printGreenSummary(result, flags.outputDir);
+    }
+    return;
+  }
+
+  if (flags.splitGreenGrid) {
+    const result = runSplitGreenGrid(flags);
+    if (!result.ok) {
+      console.error(`ERROR: ${result.error}`);
+      process.exitCode = 1;
+    } else if (!result.dryRun) {
+      printGreenSummary(result, flags.outputDir);
+    }
+    return;
+  }
+
+  if (flags.help || (prompts.length === 0 && !flags.batchFile && !flags.edit && !flags.nailStressTest && !flags.workflowBatchEdit && !flags.greenScreen && !flags.greenScreenBatch)) {
     printUsage({ internal: flags.internal === true });
     return;
   }
@@ -5411,6 +5617,67 @@ async function main() {
       : "Run --set-key <key> or --add-worker-key <key> first.";
     console.error(`ERROR: No enabled ${providerText} API worker is configured. ${setupHint}`);
     process.exit(1);
+  }
+
+  if (flags.greenScreen) {
+    if (prompts.length === 0) {
+      console.error("ERROR: --green-screen requires --prompt <text>.");
+      process.exit(1);
+    }
+    const aspect = flags.aspect ?? flags.ratio ?? config.quickMode?.ratio ?? "1:1";
+    const { size } = resolveGenerationParams({ ...flags, aspect }, config.quickMode, { provider: providerForRun, operation: "generate", apimartResolution: requestedApimartResolution });
+    const result = await runGreenScreenGenerate(configuredWorkers, prompts[0], size, flags.outputDir || join(homedir(), "Pictures", "fhl-image-gen", `green-screen_${timestamp()}`), {
+      adaptive: flags.adaptive !== false,
+      fhlApiMode: effectiveFhlApiMode,
+      apimartResolution: requestedApimartResolution,
+      dryRun: !!flags.dryRun,
+      greenThreshold: flags.greenThreshold,
+      spillThreshold: flags.spillThreshold,
+      edgeFeather: flags.edgeFeather,
+      backgroundColor: flags.backgroundColor,
+    });
+    if (!result.ok) {
+      console.error(`Green-screen failed: ${result.error || "processing failed"}`);
+      if (result.report) printWorkerStats(result.report);
+      process.exitCode = 1;
+      return;
+    }
+    if (!result.dryRun) printGreenSummary(result.processor, result.outputRoot);
+    return;
+  }
+
+  if (flags.greenScreenBatch) {
+    if (!flags.batchFile) {
+      console.error("ERROR: --green-screen-batch requires --batch <tasks.json>.");
+      process.exit(1);
+    }
+    let parsed;
+    try { parsed = JSON.parse(readFileSync(flags.batchFile, "utf8")); } catch (error) { console.error(`ERROR: Cannot read batch file: ${error.message}`); process.exit(1); }
+    const tasks = Array.isArray(parsed) ? parsed : parsed?.tasks;
+    if (!Array.isArray(tasks) || tasks.length === 0 || tasks.some((task) => !task || typeof task.prompt !== "string" || !task.prompt.trim())) {
+      console.error("ERROR: Batch file must be an array or { \"tasks\": [...] } with a prompt on every task.");
+      process.exit(1);
+    }
+    if (tasks.length > MAX_BATCH_PROMPTS) {
+      console.error(`ERROR: Green-screen batch supports up to ${MAX_BATCH_PROMPTS} tasks.`);
+      process.exit(1);
+    }
+    const aspect = flags.aspect ?? flags.ratio ?? config.batchMode?.ratio ?? "1:1";
+    const { size } = resolveGenerationParams({ ...flags, aspect }, config.batchMode || config.quickMode, { provider: providerForRun, operation: "generate", apimartResolution: requestedApimartResolution });
+    const result = await runGreenScreenBatch(configuredWorkers, tasks, size, flags.outputDir || join(homedir(), "Pictures", "fhl-image-gen", `green-screen-batch_${timestamp()}`), {
+      adaptive: flags.adaptive !== false,
+      concurrency: clampInteger(flags.concurrency ?? config.batchMode?.concurrency, 1, MAX_CONCURRENCY, DEFAULTS.concurrency),
+      fhlApiMode: effectiveFhlApiMode,
+      apimartResolution: requestedApimartResolution,
+      dryRun: !!flags.dryRun,
+      greenThreshold: flags.greenThreshold,
+      spillThreshold: flags.spillThreshold,
+      edgeFeather: flags.edgeFeather,
+      backgroundColor: flags.backgroundColor,
+    });
+    printGreenSummary(result, result.outputRoot || flags.outputDir);
+    process.exitCode = result.ok ? 0 : 1;
+    return;
   }
 
   if (flags.workflowBatchEdit) {

@@ -1,8 +1,8 @@
 # FHL Codex Plugins
 
-## v0.2.1 开发版说明
+## v0.2.2 发布审核版说明
 
-v0.2.1 默认使用 FHL Images API 主链路。FHL Responses 当前不可用，不作为用户可切换路线；如果 Images API 失败，插件继续按 Images API 重试。
+v0.2.2 默认使用 FHL Images API 主链路。FHL Responses 当前不可用，不作为用户可切换路线；如果 Images API 失败，插件继续按 Images API 重试。
 
 当前规则固定为：
 
@@ -10,6 +10,7 @@ v0.2.1 默认使用 FHL Images API 主链路。FHL Responses 当前不可用，�
 - 不再对用户开放 Responses 切换
 - 失败重试仍发生在 Images API 链路上
 - 默认请求 2K；只有用户明确要求 4K 时才加 `--quality 4K`
+- 多参考图统一使用重复的 `image` multipart 字段上传，避免人物身份参考丢失
 - `--legacy-edit` 和 `--edit-api images` 继续保留为旧入口报错，不作为新链路使用方式
 
 示例：
@@ -24,7 +25,21 @@ node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --edit --image "C:\path\
 
 给 Codex 用的 FHL 插件 marketplace。
 
-当前提供插件：`fhl-image-gen`
+当前提供插件：`fhl-image-gen`（v0.2.2）
+
+## 透明 PNG 工作流
+
+FHL 当前返回的图片不保证原生 Alpha。v0.2.2 使用纯绿幕提示词生成源图，再由插件内置的 Pillow + NumPy 处理器只移除边缘连通绿幕，输出真正带 Alpha 通道的 PNG。
+
+```powershell
+node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --doctor
+node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --green-screen --prompt "一个带白色描边的表情包角色" --aspect 1:1 --output-dir "C:\output"
+node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --remove-green --image "C:\input\green.png" --output-dir "C:\output"
+node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --split-green-grid --image "C:\input\grid.png" --columns 4 --rows 6 --output-dir "C:\output"
+node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --green-screen-batch --batch "tasks.json" --output-dir "C:\output"
+```
+
+绿幕功能会输出原始绿幕图、透明 PNG、预览图、质量报告、失败重试记录和 SHA-256。缺少 Codex Python、Pillow 或 NumPy 时，`--doctor` 会报告环境问题；原有普通生图功能仍可使用。
 
 ## 快速开始
 
@@ -93,6 +108,14 @@ fhl-image-gen@fhl-plugins
 ```bash
 codex plugin marketplace upgrade fhl-plugins
 ```
+
+已安装旧版的用户，也可以直接在 Codex 聊天窗口发送：
+
+```text
+帮我更新插件[https://github.com/supart/FHL-Codex-Plugins]
+```
+
+这会以 `fhl-plugins` marketplace 为来源刷新 `fhl-image-gen`；如果当前还没有添加该 marketplace，先发送添加 marketplace 的请求。
 
 ## 首次配置 API Key
 
@@ -218,6 +241,8 @@ node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --edit --image "C:\path\
 ```powershell
 node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --edit --image "C:\path\one.png" --image "C:\path\two.png" --image "C:\path\three.png" --prompt "将这些参考图组合成一个完整场景，保留主要特征并生成高质量海报" --aspect 16:9
 ```
+
+v0.2.2 起，所有参考图都通过重复的 `image` multipart 字段上传。不要混用 `image` 和 `image[]`；后者只保留在内部诊断模式中。
 
 当前单次多参考图上传上限保留为 `10` 张，用于内部诊断和手动重试。生产使用建议控制在 `1..5` 张参考图，并采用顺序或低并发。`6..10` 张属于重任务/实验范围，容易遇到 FHL 上游 `524` 或网络超时。10 worker 图生图并发目前只验证适合单参考图；2 张及以上参考图的合成请求不建议高并发，如果需要大量出图，优先分组生成或顺序运行。
 
@@ -428,7 +453,7 @@ node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --get-config
 - marketplace 展示名：`FHL Plugins`
 - 插件标识：`fhl-image-gen@fhl-plugins`
 - 插件目录：`./plugins/fhl-image-gen`
-- 当前版本：`0.2.0`
+- 当前版本：`0.2.2`
 
 如果你只想记住两条命令，就记这两行：
 

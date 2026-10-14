@@ -1,13 +1,13 @@
 ---
 name: "fhl-image-gen"
-description: "Generate or edit images using the FHL Image Gen plugin. Trigger when the user wants AI images through FHL Images API, plus multi-worker image generation, batch image generation, continuous image generation, images saved to disk, or edits to existing images."
+description: "Generate or edit images using the FHL Image Gen plugin, or refresh the installed plugin from the FHL marketplace. Trigger when the user wants AI images through FHL Images API, plus multi-worker image generation, batch image generation, continuous image generation, images saved to disk, edits to existing images, or a plugin update."
 ---
 
 # FHL Image Gen
 
 Use this skill to generate or edit raster images through FHL. For ordinary user setup and usage, present FHL as the only supported provider.
 
-Current `v0.2.1` routing rule:
+Current `v0.2.2` routing rule:
 
 - FHL public generation and edit routes use Images API
 - Do not switch FHL tasks to Responses
@@ -15,6 +15,18 @@ Current `v0.2.1` routing rule:
 - If Images API fails, retry Images API, lower concurrency, or rerun later
 - Responses code can remain in the script for internal diagnostics, but it is not user-facing behavior
 - `--legacy-edit` and `--edit-api images` remain invalid legacy entry points
+- Green-screen transparency is produced locally; do not claim that FHL itself returns reliable alpha.
+- Multi-reference Images API edits upload every reference with the repeated `image` multipart field. Do not use mixed `image` and `image[]` fields for production requests.
+
+## Plugin Update
+
+When the user asks to update this plugin and provides the FHL marketplace URL, use the marketplace refresh flow instead of running an image-generation command:
+
+```text
+帮我更新插件[https://github.com/supart/FHL-Codex-Plugins]
+```
+
+The configured marketplace name is `fhl-plugins`; the installed plugin name is `fhl-image-gen@fhl-plugins`.
 
 ## Script
 
@@ -138,6 +150,29 @@ node "$HOME/plugins/fhl-image-gen/scripts/generate.mjs" --prompt "涓€鍙�
 ```
 
 ## Batch Generate
+
+## Green Screen and Transparent PNG
+
+Run `--doctor` before green-screen work to verify the Codex Python runtime, Pillow, and NumPy:
+
+```powershell
+node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --doctor
+```
+
+Generate a solid green source, then remove only edge-connected green locally:
+
+```powershell
+node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --green-screen --prompt "一个带白色描边的表情包角色" --aspect 1:1 --output-dir "C:\output"
+node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --remove-green --image "C:\input\green.png" --output-dir "C:\output"
+node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --split-green-grid --image "C:\input\grid.png" --columns 4 --rows 6 --output-dir "C:\output" --captions "caption1,caption2"
+node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --green-screen-batch --batch "tasks.json" --output-dir "C:\output"
+```
+
+The processor keeps closed green details inside the subject, writes RGBA PNG files, previews, manifests, quality reports, retry reports, and SHA-256 values. Missing local dependencies fail this workflow clearly and never delete the raw source.
+
+For every successful `--green-screen` or `--green-screen-batch` task, show both the saved raw green source (`raw_green/source.png`) and the processed transparent PNG in the Codex conversation. For grid tasks, show the raw source and a small sample of processed outputs/contact sheet.
+
+The batch file accepts either an array of task objects or `{ "tasks": [...] }`; every task needs `prompt`, while `id`, `aspect`, `quality`, and `count` are optional.
 
 Use batch mode for multiple different prompts:
 
@@ -295,6 +330,7 @@ node "$HOME\plugins\fhl-image-gen\scripts\generate.mjs" --nail-stress-test --per
 - Worker routing rule: single task = single worker; multiple independent tasks = many workers when available
 - Workflow batch edit: generic fixed refs + variable item ref + user templates. Do not assume product type.
 - Workflow reliability: resume existing PNG outputs, auto repair missing outputs, and write `manifest.json`, `summary.csv`, `failures.json`, and `sessions.json`.
+- Green-screen processor: `scripts/green_screen_processor.py`, using Codex bundled Python with Pillow and NumPy when available.
 
 ## Verification
 
